@@ -7,8 +7,8 @@ Add the following entry to `config/extra.toml` so BallsDex installs the package 
 
 ```toml
 [[ballsdex.packages]]
-location = "git+https://github.com/Haymooed/BallsDex-CommunityChallenge.git"
-path = "event"
+location = "git+https://github.com/Haymooed/BallsDex-CommunityChallenge-Package.git"
+path = "community_challenge"
 enabled = true
 editable = false
 ```
