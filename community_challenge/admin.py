@@ -16,7 +16,7 @@ class CommunityChallengeAdmin(admin.ModelAdmin):
             "fields": ("start_time", "end_time")
         }),
         ("Progress Configuration", {
-            "fields": ("type", "target_amount", "manual_progress"),
-            "description": "Configure how the challenge progress is tracked. For 'Manual', update 'Manual Progress' field. For 'Balls Caught', it calculates automatically."
+            "fields": ("type", "target_amount", "manual_progress", "ball", "special"),
+            "description": "Configure how the challenge progress is tracked. Select 'ball' or 'special' if using the specific types."
         }),
     )
