@@ -1,41 +1,39 @@
-import logging
-import datetime
-
-from typing import TYPE_CHECKING
-from discord.ext import commands
-from discord import app_commands
-import discord
-from django.utils import timezone
-
-from community_challenge.models import CommunityChallenge
-
-if TYPE_CHECKING:
-    from ballsdex.core.bot import BallsDexBot
-
-log = logging.getLogger("ballsdex.packages.community_challenge")
-
-
-class CommunityChallengeCog(commands.Cog):
-    def __init__(self, bot: "BallsDexBot"):
-        self.bot = bot
-
-    @app_commands.command(description="List active community challenges")
+@app_commands.command(description="List active community challenges")
     async def challenges(self, interaction: discord.Interaction):
         now = timezone.now()
         active_challenges = CommunityChallenge.objects.filter(
             is_active=True, start_time__lte=now, end_time__gte=now
         )
 
-        if not await active_challenges.exists():
+        if not await active_challenges.aexists():
             await interaction.response.send_message("There are no active community challenges at the moment.", ephemeral=True)
             return
 
         embed = discord.Embed(title="Community Challenges", color=discord.Color.blue())
         async for challenge in active_challenges:
-            embed.add_field(
-                name=challenge.title,
-                value=f"{challenge.description}\nEnds: <t:{int(challenge.end_time.timestamp())}:R>",
-                inline=False,
-            )
+            # Calculate progress
+            if challenge.type == "balls_caught":
+                # Count balls caught since start of challenge
+                current = await BallInstance.objects.filter(
+                    catch_date__gte=challenge.start_time,
+                    catch_date__lte=now 
+                ).acount()
+            elif challenge.type == "specials_caught":
+                # Count special balls caught
+                current = await BallInstance.objects.filter(
+                    catch_date__gte=challenge.start_time,
+                    catch_date__lte=now,
+                    special__isnull=False
+                ).acount()
+            else:
+                # Manual progress
+                current = challenge.manual_progress
 
-        await interaction.response.send_message(embed=embed)
+            target = challenge.target_amount
+            percentage = min(current / target, 1.0) if target > 0 else 0
+            
+            # Generate progress bar
+            filled_length = int(10 * percentage)
+            bar = "█" * filled_length + "░" * (10 - filled_length)
+            
+            progress_text = f"`[{bar}]` {int(percentage * 100)}% ({current}/{target})"
