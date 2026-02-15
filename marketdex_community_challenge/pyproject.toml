@@ -1,0 +1,6 @@
+[project]
+name = "marketdex-community-challenge"
+version = "0.1.0"
+dependencies = [
+    "ballsdex>=2.0.0",
+]
