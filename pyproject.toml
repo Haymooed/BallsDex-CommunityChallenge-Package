@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ballsdex-community-challenge"
-version = "1.0.0"
+version = "0.0.0"
 
 description = "Community Challenge system for BallsDex v3 — cooperative goals with admin-panel configuration."
 license = "MIT"
