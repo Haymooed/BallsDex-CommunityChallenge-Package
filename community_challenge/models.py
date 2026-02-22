@@ -3,22 +3,37 @@ from __future__ import annotations
 from django.db import models
 from django.utils import timezone
 
-from bd_models.models import Player
+from bd_models.models import Ball, Player, Special
 
 
 class ChallengeType(models.TextChoices):
-    # Ball catching
+    # Event-based (tracked via on_message_edit — the bot edits the spawn message on catch)
     CATCH_ANY      = "catch_any",      "Catch any ball"
-    CATCH_SPECIAL  = "catch_special",  "Catch a special ball"
-    # Guessing
-    GUESS_WRONG    = "guess_wrong",    "Guess wrong (wrong answer attempts)"
-    GUESS_CORRECT  = "guess_correct",  "Guess correct (first-try catches)"
-    # Trading
-    TRADE          = "trade",          "Complete a trade"
-    # Collection milestones (snapshot-based, checked on /challenge view)
-    BALLS_OWNED    = "balls_owned",    "Community total balls owned"
-    UNIQUE_BALLS   = "unique_balls",   "Community unique ball types owned"
-    SPECIALS_OWNED = "specials_owned", "Community total specials owned"
+    CATCH_SPECIFIC = "catch_specific", "Catch a specific ball (set Ball filter below)"
+    CATCH_SPECIAL  = "catch_special",  "Catch any special ball"
+    CATCH_SPECIFIC_SPECIAL = "catch_specific_special", "Catch a specific special (set Special filter below)"
+    GUESS_WRONG    = "guess_wrong",    "Wrong guesses submitted"
+    TRADE          = "trade",          "Trades completed"
+    # Snapshot-based (live DB count, recalculated on /challenge view)
+    BALLS_OWNED    = "balls_owned",    "Community total balls owned (snapshot)"
+    UNIQUE_BALLS   = "unique_balls",   "Community unique ball types owned (snapshot)"
+    SPECIALS_OWNED = "specials_owned", "Community total specials owned (snapshot)"
+
+
+EVENT_TYPES = {
+    ChallengeType.CATCH_ANY,
+    ChallengeType.CATCH_SPECIFIC,
+    ChallengeType.CATCH_SPECIAL,
+    ChallengeType.CATCH_SPECIFIC_SPECIAL,
+    ChallengeType.GUESS_WRONG,
+    ChallengeType.TRADE,
+}
+
+SNAPSHOT_TYPES = {
+    ChallengeType.BALLS_OWNED,
+    ChallengeType.UNIQUE_BALLS,
+    ChallengeType.SPECIALS_OWNED,
+}
 
 
 class ChallengeSettings(models.Model):
@@ -51,33 +66,55 @@ class ChallengeSettings(models.Model):
 
 
 class CommunityChallenge(models.Model):
-    """A single cooperative challenge, managed entirely from the admin panel."""
+    """A cooperative challenge configured entirely from the admin panel."""
 
     name = models.CharField(max_length=64, help_text="Display name shown to players.")
     description = models.CharField(max_length=256, blank=True)
     challenge_type = models.CharField(
-        max_length=20,
+        max_length=24,
         choices=ChallengeType.choices,
         default=ChallengeType.CATCH_ANY,
+    )
+
+    # ── Optional filters (only used for CATCH_SPECIFIC / CATCH_SPECIFIC_SPECIAL) ──
+    ball_filter = models.ForeignKey(
+        Ball,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
         help_text=(
-            "What players must do to contribute. "
-            "Event-based types (catch, guess, trade) are tracked in real-time via message events. "
-            "Snapshot types (balls_owned, unique_balls, specials_owned) are recalculated "
-            "from the database whenever a player runs /challenge view."
+            "Required for 'Catch a specific ball'. "
+            "Leave blank to accept any ball for other catch types."
         ),
     )
+    special_filter = models.ForeignKey(
+        Special,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text=(
+            "Required for 'Catch a specific special'. "
+            "Leave blank to accept any special for 'Catch any special ball'."
+        ),
+    )
+
     target_amount = models.PositiveIntegerField(
         default=1000,
-        help_text="Community-wide goal. For snapshot types this is the total DB count to reach.",
+        help_text=(
+            "Community-wide goal. "
+            "For snapshot types this is the live DB total to reach."
+        ),
     )
     reward_balls = models.PositiveSmallIntegerField(
         default=0,
-        help_text="Number of balls to gift each contributor on completion (0 = no reward).",
+        help_text="Balls gifted to each contributor on completion (0 = no reward).",
     )
     enabled = models.BooleanField(default=True, help_text="Toggle without deleting.")
     completed = models.BooleanField(
         default=False,
-        help_text="Set automatically when progress hits target. Reset to re-open.",
+        help_text="Set automatically when target is hit. Reset manually to re-run.",
     )
     created_at = models.DateTimeField(auto_now_add=True)
     completed_at = models.DateTimeField(null=True, blank=True)
@@ -92,20 +129,11 @@ class CommunityChallenge(models.Model):
 
     @property
     def is_snapshot(self) -> bool:
-        """Snapshot challenges pull their total from the live DB, not from ChallengeProgress."""
-        return self.challenge_type in (
-            ChallengeType.BALLS_OWNED,
-            ChallengeType.UNIQUE_BALLS,
-            ChallengeType.SPECIALS_OWNED,
-        )
+        return self.challenge_type in SNAPSHOT_TYPES
 
 
 class ChallengeProgress(models.Model):
-    """
-    One row per (player, challenge) for event-based challenges.
-    Snapshot challenges do not use this table for their total
-    (but a row is still created to track individual contribution for leaderboards).
-    """
+    """One row per (player, challenge) — incremented as events occur."""
 
     challenge = models.ForeignKey(
         CommunityChallenge,

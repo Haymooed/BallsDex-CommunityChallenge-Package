@@ -1,10 +1,6 @@
 """
-0002_fix_schema
----------------
-Corrective migration for users who ran an earlier broken version.
-Drops all community_challenge_* tables (CASCADE) and recreates them
-with the correct schema. Safe because the previous version 500'd on
-every admin panel page — no real data exists.
+0002_fix_schema — drops all community_challenge_* tables and recreates with correct schema.
+Safe because the previous version 500'd on all admin pages — no real data to preserve.
 """
 from django.db import migrations, models
 import django.db.models.deletion
@@ -30,7 +26,7 @@ class Migration(migrations.Migration):
             name="ChallengeSettings",
             fields=[
                 ("singleton_id", models.PositiveSmallIntegerField(default=1, editable=False, primary_key=True, serialize=False)),
-                ("enabled", models.BooleanField(default=True, help_text="Master switch — disable to hide all challenges.")),
+                ("enabled", models.BooleanField(default=True)),
                 ("announcement_channel_id", models.BigIntegerField(blank=True, null=True)),
             ],
             options={"verbose_name": "Challenge settings", "verbose_name_plural": "Challenge settings"},
@@ -44,17 +40,20 @@ class Migration(migrations.Migration):
                 ("challenge_type", models.CharField(
                     choices=[
                         ("catch_any", "Catch any ball"),
-                        ("catch_special", "Catch a special ball"),
-                        ("guess_wrong", "Guess wrong (wrong answer attempts)"),
-                        ("guess_correct", "Guess correct (first-try catches)"),
-                        ("trade", "Complete a trade"),
-                        ("balls_owned", "Community total balls owned"),
-                        ("unique_balls", "Community unique ball types owned"),
-                        ("specials_owned", "Community total specials owned"),
+                        ("catch_specific", "Catch a specific ball (set Ball filter below)"),
+                        ("catch_special", "Catch any special ball"),
+                        ("catch_specific_special", "Catch a specific special (set Special filter below)"),
+                        ("guess_wrong", "Wrong guesses submitted"),
+                        ("trade", "Trades completed"),
+                        ("balls_owned", "Community total balls owned (snapshot)"),
+                        ("unique_balls", "Community unique ball types owned (snapshot)"),
+                        ("specials_owned", "Community total specials owned (snapshot)"),
                     ],
                     default="catch_any",
-                    max_length=20,
+                    max_length=24,
                 )),
+                ("ball_filter", models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name="+", to="bd_models.ball")),
+                ("special_filter", models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name="+", to="bd_models.special")),
                 ("target_amount", models.PositiveIntegerField(default=1000)),
                 ("reward_balls", models.PositiveSmallIntegerField(default=0)),
                 ("enabled", models.BooleanField(default=True)),

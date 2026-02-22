@@ -30,16 +30,34 @@ class ChallengeProgressInline(admin.TabularInline):
 class CommunityChallengeAdmin(admin.ModelAdmin):
     list_display = (
         "name", "challenge_type", "target_amount",
-        "current_progress", "reward_balls", "enabled", "completed", "created_at",
+        "current_progress", "ball_filter", "special_filter",
+        "reward_balls", "enabled", "completed", "created_at",
     )
     list_filter = ("challenge_type", "enabled", "completed")
     search_fields = ("name", "description")
     readonly_fields = ("created_at", "completed_at", "current_progress")
+    autocomplete_fields = ("ball_filter", "special_filter")
     fieldsets = (
-        ("Identity", {"fields": ("name", "description", "challenge_type")}),
-        ("Goal", {"fields": ("target_amount", "current_progress")}),
-        ("Reward", {"fields": ("reward_balls",)}),
-        ("Status", {"fields": ("enabled", "completed", "created_at", "completed_at")}),
+        ("Identity", {
+            "fields": ("name", "description", "challenge_type"),
+        }),
+        ("Filters", {
+            "description": (
+                "Optional — restrict which balls/specials count towards this challenge. "
+                "ball_filter is required for 'Catch a specific ball'. "
+                "special_filter is required for 'Catch a specific special'."
+            ),
+            "fields": ("ball_filter", "special_filter"),
+        }),
+        ("Goal", {
+            "fields": ("target_amount", "current_progress"),
+        }),
+        ("Reward", {
+            "fields": ("reward_balls",),
+        }),
+        ("Status", {
+            "fields": ("enabled", "completed", "created_at", "completed_at"),
+        }),
     )
     inlines = (ChallengeProgressInline,)
 
