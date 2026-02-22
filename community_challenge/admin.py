@@ -9,25 +9,16 @@ from .models import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Settings (singleton)
-# ---------------------------------------------------------------------------
-
 @admin.register(ChallengeSettings)
 class ChallengeSettingsAdmin(admin.ModelAdmin):
     list_display = ("enabled", "announcement_channel_id")
 
     def has_add_permission(self, request):
-        # Singleton — block creating a second row.
-        return False
+        return False  # singleton
 
     def has_delete_permission(self, request, obj=None):
         return False
 
-
-# ---------------------------------------------------------------------------
-# Challenges
-# ---------------------------------------------------------------------------
 
 class ChallengeProgressInline(admin.TabularInline):
     model = ChallengeProgress
@@ -35,10 +26,8 @@ class ChallengeProgressInline(admin.TabularInline):
     readonly_fields = ("player", "amount", "last_updated")
     can_delete = False
     ordering = ("-amount",)
-    show_change_link = False
 
     def get_queryset(self, request):
-        # Show only top 25 contributors inline to keep the page fast.
         return super().get_queryset(request).order_by("-amount")[:25]
 
 
@@ -49,38 +38,30 @@ class CommunityChallengeAdmin(admin.ModelAdmin):
         "challenge_type",
         "target_amount",
         "current_progress",
+        "reward_balls",
         "enabled",
         "completed",
         "created_at",
-        "completed_at",
     )
     list_filter = ("challenge_type", "enabled", "completed")
-    search_fields = ("name", "description", "reward_item")
+    search_fields = ("name", "description")
     readonly_fields = ("created_at", "completed_at", "current_progress")
     fieldsets = (
         (
             "Identity",
-            {
-                "fields": ("name", "description", "challenge_type"),
-            },
+            {"fields": ("name", "description", "challenge_type")},
         ),
         (
             "Goal",
-            {
-                "fields": ("target_amount", "current_progress"),
-            },
+            {"fields": ("target_amount", "current_progress")},
         ),
         (
             "Reward",
-            {
-                "fields": ("reward_item", "reward_quantity"),
-            },
+            {"fields": ("reward_balls",)},
         ),
         (
             "Status",
-            {
-                "fields": ("enabled", "completed", "created_at", "completed_at"),
-            },
+            {"fields": ("enabled", "completed", "created_at", "completed_at")},
         ),
     )
     inlines = (ChallengeProgressInline,)
@@ -97,10 +78,6 @@ class CommunityChallengeAdmin(admin.ModelAdmin):
         return f"{total:,} / {obj.target_amount:,} ({pct}%)"
 
 
-# ---------------------------------------------------------------------------
-# Progress entries
-# ---------------------------------------------------------------------------
-
 @admin.register(ChallengeProgress)
 class ChallengeProgressAdmin(admin.ModelAdmin):
     list_display = ("challenge", "player", "amount", "last_updated")
@@ -113,16 +90,12 @@ class ChallengeProgressAdmin(admin.ModelAdmin):
         return False
 
 
-# ---------------------------------------------------------------------------
-# Reward log
-# ---------------------------------------------------------------------------
-
 @admin.register(ChallengeReward)
 class ChallengeRewardAdmin(admin.ModelAdmin):
-    list_display = ("challenge", "player", "reward_item", "reward_quantity", "issued_at")
-    list_filter = ("challenge", "reward_item")
+    list_display = ("challenge", "player", "balls_given", "issued_at")
+    list_filter = ("challenge",)
     search_fields = ("player__discord_id",)
-    readonly_fields = ("challenge", "player", "reward_item", "reward_quantity", "issued_at")
+    readonly_fields = ("challenge", "player", "balls_given", "issued_at")
 
     def has_add_permission(self, request):
         return False

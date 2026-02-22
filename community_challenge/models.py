@@ -1,24 +1,20 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import TYPE_CHECKING
 
 from django.db import models
 from django.utils import timezone
 
-from bd_models.models import Ball, BallInstance, Player, Special
+from bd_models.models import Player
 
 
 # ---------------------------------------------------------------------------
-# Challenge type choices
+# Challenge type choices — matches real BallsDex player actions
 # ---------------------------------------------------------------------------
 
 class ChallengeType(models.TextChoices):
-    COLLECT = "collect", "Collect"
-    TRADE   = "trade",   "Trade"
-    CRAFT   = "craft",   "Craft"
-    CATCH   = "catch",   "Catch"
-    DONATE  = "donate",  "Donate"
+    CATCH  = "catch",  "Catch"
+    TRADE  = "trade",  "Trade"
 
 
 # ---------------------------------------------------------------------------
@@ -27,8 +23,7 @@ class ChallengeType(models.TextChoices):
 
 class ChallengeSettings(models.Model):
     """
-    Singleton that holds system-wide settings for Community Challenges.
-    Managed entirely from the Django admin panel.
+    Singleton — system-wide settings, managed entirely from the admin panel.
     """
 
     singleton_id = models.PositiveSmallIntegerField(
@@ -42,15 +37,16 @@ class ChallengeSettings(models.Model):
         null=True,
         blank=True,
         help_text=(
-            "Discord channel ID where challenge completion announcements are sent. "
+            "Discord channel ID where completion announcements are sent. "
             "Leave blank to disable announcements."
         ),
     )
 
     class Meta:
         verbose_name = "Challenge settings"
+        verbose_name_plural = "Challenge settings"
 
-    def __str__(self) -> str:  # pragma: no cover
+    def __str__(self) -> str:
         return "Challenge Settings"
 
     @classmethod
@@ -69,7 +65,10 @@ class CommunityChallenge(models.Model):
     A single cooperative challenge, created and managed from the admin panel.
     """
 
-    name = models.CharField(max_length=64, help_text="Display name shown to players.")
+    name = models.CharField(
+        max_length=64,
+        help_text="Display name shown to players.",
+    )
     description = models.CharField(
         max_length=256,
         blank=True,
@@ -79,27 +78,19 @@ class CommunityChallenge(models.Model):
         max_length=16,
         choices=ChallengeType.choices,
         default=ChallengeType.CATCH,
-        help_text="The action type players must perform to contribute.",
+        help_text="The action players must perform to contribute.",
     )
     target_amount = models.PositiveIntegerField(
         default=1000,
-        help_text="Total community-wide contributions needed to complete this challenge.",
+        help_text="Total community-wide contributions needed to complete.",
     )
-    reward_item = models.CharField(
-        max_length=64,
-        blank=True,
-        help_text=(
-            "String key identifying the reward (e.g. 'winter_crate'). "
-            "Used by the reward distribution logic."
-        ),
-    )
-    reward_quantity = models.PositiveSmallIntegerField(
-        default=1,
-        help_text="How many reward items each contributor receives upon completion.",
+    reward_balls = models.PositiveSmallIntegerField(
+        default=0,
+        help_text="Number of balls to gift each contributor on completion (0 = none).",
     )
     enabled = models.BooleanField(
         default=True,
-        help_text="Toggle visibility without deleting the challenge.",
+        help_text="Toggle visibility without deleting.",
     )
     completed = models.BooleanField(
         default=False,
@@ -119,22 +110,6 @@ class CommunityChallenge(models.Model):
     def __str__(self) -> str:
         return self.name
 
-    # ------------------------------------------------------------------
-    # Convenience helpers
-    # ------------------------------------------------------------------
-
-    async def total_progress(self) -> int:
-        """Sum of all contribution amounts for this challenge."""
-        result = await ChallengeProgress.objects.filter(challenge=self).aaggregate(
-            total=models.Sum("amount")
-        )
-        return result["total"] or 0
-
-    async def is_complete(self) -> bool:
-        if self.completed:
-            return True
-        return await self.total_progress() >= self.target_amount
-
 
 # ---------------------------------------------------------------------------
 # Per-player progress entries
@@ -142,8 +117,7 @@ class CommunityChallenge(models.Model):
 
 class ChallengeProgress(models.Model):
     """
-    Tracks how much a single player has contributed to a specific challenge.
-    One row per (player, challenge) pair; amount is incremented over time.
+    One row per (player, challenge) — amount is incremented as players act.
     """
 
     challenge = models.ForeignKey(
@@ -172,17 +146,16 @@ class ChallengeProgress(models.Model):
         verbose_name_plural = "Challenge Progress Entries"
 
     def __str__(self) -> str:
-        return f"{self.player_id} → {self.challenge.name}: {self.amount}"
+        return f"Player {self.player_id} → {self.challenge_id}: {self.amount}"
 
 
 # ---------------------------------------------------------------------------
-# Reward distribution log
+# Reward log — idempotency guard + audit trail
 # ---------------------------------------------------------------------------
 
 class ChallengeReward(models.Model):
     """
-    Records that a reward was issued to a player for completing a challenge.
-    Prevents double-rewarding and provides an audit trail.
+    Records that a reward was issued. Prevents double-rewarding.
     """
 
     challenge = models.ForeignKey(
@@ -195,8 +168,7 @@ class ChallengeReward(models.Model):
         on_delete=models.CASCADE,
         related_name="challenge_rewards",
     )
-    reward_item = models.CharField(max_length=64)
-    reward_quantity = models.PositiveSmallIntegerField()
+    balls_given = models.PositiveSmallIntegerField(default=0)
     issued_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -206,7 +178,4 @@ class ChallengeReward(models.Model):
         verbose_name_plural = "Challenge Rewards"
 
     def __str__(self) -> str:
-        return (
-            f"{self.player_id} ← {self.reward_quantity}× {self.reward_item} "
-            f"({self.challenge.name})"
-        )
+        return f"Player {self.player_id} ← {self.balls_given} balls ({self.challenge_id})"

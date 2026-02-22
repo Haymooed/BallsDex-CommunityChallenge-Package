@@ -1,6 +1,5 @@
 from django.db import migrations, models
 import django.db.models.deletion
-import django.utils.timezone
 
 
 class Migration(migrations.Migration):
@@ -11,9 +10,6 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        # ------------------------------------------------------------------
-        # ChallengeSettings (singleton)
-        # ------------------------------------------------------------------
         migrations.CreateModel(
             name="ChallengeSettings",
             fields=[
@@ -35,20 +31,15 @@ class Migration(migrations.Migration):
                     models.BigIntegerField(
                         blank=True,
                         null=True,
-                        help_text=(
-                            "Discord channel ID where challenge completion announcements are sent. "
-                            "Leave blank to disable announcements."
-                        ),
+                        help_text="Discord channel ID for completion announcements.",
                     ),
                 ),
             ],
             options={
                 "verbose_name": "Challenge settings",
+                "verbose_name_plural": "Challenge settings",
             },
         ),
-        # ------------------------------------------------------------------
-        # CommunityChallenge
-        # ------------------------------------------------------------------
         migrations.CreateModel(
             name="CommunityChallenge",
             fields=[
@@ -58,74 +49,20 @@ class Migration(migrations.Migration):
                         auto_created=True, primary_key=True, serialize=False, verbose_name="ID"
                     ),
                 ),
-                (
-                    "name",
-                    models.CharField(
-                        max_length=64, help_text="Display name shown to players."
-                    ),
-                ),
-                (
-                    "description",
-                    models.CharField(
-                        blank=True,
-                        max_length=256,
-                        help_text="Short description shown in the /challenge embed.",
-                    ),
-                ),
+                ("name", models.CharField(max_length=64, help_text="Display name shown to players.")),
+                ("description", models.CharField(blank=True, max_length=256)),
                 (
                     "challenge_type",
                     models.CharField(
-                        choices=[
-                            ("collect", "Collect"),
-                            ("trade", "Trade"),
-                            ("craft", "Craft"),
-                            ("catch", "Catch"),
-                            ("donate", "Donate"),
-                        ],
+                        choices=[("catch", "Catch"), ("trade", "Trade")],
                         default="catch",
                         max_length=16,
-                        help_text="The action type players must perform to contribute.",
                     ),
                 ),
-                (
-                    "target_amount",
-                    models.PositiveIntegerField(
-                        default=1000,
-                        help_text="Total community-wide contributions needed to complete this challenge.",
-                    ),
-                ),
-                (
-                    "reward_item",
-                    models.CharField(
-                        blank=True,
-                        max_length=64,
-                        help_text="String key identifying the reward (e.g. 'winter_crate').",
-                    ),
-                ),
-                (
-                    "reward_quantity",
-                    models.PositiveSmallIntegerField(
-                        default=1,
-                        help_text="How many reward items each contributor receives upon completion.",
-                    ),
-                ),
-                (
-                    "enabled",
-                    models.BooleanField(
-                        default=True,
-                        help_text="Toggle visibility without deleting the challenge.",
-                    ),
-                ),
-                (
-                    "completed",
-                    models.BooleanField(
-                        default=False,
-                        help_text=(
-                            "Set automatically when progress reaches target_amount. "
-                            "Reset to False to re-open the challenge."
-                        ),
-                    ),
-                ),
+                ("target_amount", models.PositiveIntegerField(default=1000)),
+                ("reward_balls", models.PositiveSmallIntegerField(default=0)),
+                ("enabled", models.BooleanField(default=True)),
+                ("completed", models.BooleanField(default=False)),
                 ("created_at", models.DateTimeField(auto_now_add=True)),
                 ("completed_at", models.DateTimeField(blank=True, null=True)),
             ],
@@ -135,9 +72,6 @@ class Migration(migrations.Migration):
                 "ordering": ("-created_at",),
             },
         ),
-        # ------------------------------------------------------------------
-        # ChallengeProgress
-        # ------------------------------------------------------------------
         migrations.CreateModel(
             name="ChallengeProgress",
             fields=[
@@ -163,13 +97,7 @@ class Migration(migrations.Migration):
                         to="bd_models.player",
                     ),
                 ),
-                (
-                    "amount",
-                    models.PositiveIntegerField(
-                        default=0,
-                        help_text="Cumulative contribution by this player to this challenge.",
-                    ),
-                ),
+                ("amount", models.PositiveIntegerField(default=0)),
                 ("last_updated", models.DateTimeField(auto_now=True)),
             ],
             options={
@@ -186,13 +114,8 @@ class Migration(migrations.Migration):
         ),
         migrations.AddIndex(
             model_name="challengeprogress",
-            index=models.Index(
-                fields=("challenge", "amount"), name="cc_challenge_amount_idx"
-            ),
+            index=models.Index(fields=("challenge", "amount"), name="cc_challenge_amount_idx"),
         ),
-        # ------------------------------------------------------------------
-        # ChallengeReward
-        # ------------------------------------------------------------------
         migrations.CreateModel(
             name="ChallengeReward",
             fields=[
@@ -218,8 +141,7 @@ class Migration(migrations.Migration):
                         to="bd_models.player",
                     ),
                 ),
-                ("reward_item", models.CharField(max_length=64)),
-                ("reward_quantity", models.PositiveSmallIntegerField()),
+                ("balls_given", models.PositiveSmallIntegerField(default=0)),
                 ("issued_at", models.DateTimeField(auto_now_add=True)),
             ],
             options={

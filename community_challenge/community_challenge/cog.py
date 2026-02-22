@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List
 
 import discord
 from asgiref.sync import sync_to_async
@@ -12,7 +12,7 @@ from django.db import IntegrityError, transaction
 from django.db.models import Sum
 from django.utils import timezone
 
-from bd_models.models import BallInstance, Player
+from bd_models.models import Player
 
 from community_challenge.models import (
     ChallengeProgress,
@@ -27,27 +27,19 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 Interaction = discord.Interaction["BallsDexBot"]
 
+
 # ---------------------------------------------------------------------------
-# Progress bar helper
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _progress_bar(current: int, target: int, width: int = 20) -> str:
-    """Return a Unicode block-style progress bar."""
     ratio = min(1.0, current / max(1, target))
     filled = round(ratio * width)
-    bar = "█" * filled + "░" * (width - filled)
-    pct = round(ratio * 100, 1)
-    return f"[{bar}] {pct}%"
+    return "[" + "█" * filled + "░" * (width - filled) + f"] {round(ratio * 100, 1)}%"
 
 
 def _type_emoji(challenge_type: str) -> str:
-    return {
-        "collect": "📦",
-        "trade":   "🔄",
-        "craft":   "⚒️",
-        "catch":   "🎣",
-        "donate":  "🎁",
-    }.get(challenge_type, "🏆")
+    return {"catch": "🎣", "trade": "🔄"}.get(challenge_type, "🏆")
 
 
 # ---------------------------------------------------------------------------
@@ -59,25 +51,20 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
 
     def __init__(self, bot: "BallsDexBot") -> None:
         self.bot = bot
-        # Lock prevents race conditions when multiple events fire simultaneously
-        # and both try to mark a challenge complete.
         self._completion_lock = asyncio.Lock()
-        # Cache of challenge IDs currently being completed, to skip redundant work.
         self._completing: set[int] = set()
 
     # ------------------------------------------------------------------
-    # Internal helpers — database queries
+    # DB helpers
     # ------------------------------------------------------------------
 
     @staticmethod
     async def _active_challenges() -> List[CommunityChallenge]:
-        qs = CommunityChallenge.objects.filter(enabled=True, completed=False)
-        return [c async for c in qs]
+        return [c async for c in CommunityChallenge.objects.filter(enabled=True, completed=False)]
 
     @staticmethod
     async def _all_enabled_challenges() -> List[CommunityChallenge]:
-        qs = CommunityChallenge.objects.filter(enabled=True)
-        return [c async for c in qs]
+        return [c async for c in CommunityChallenge.objects.filter(enabled=True)]
 
     @staticmethod
     async def _challenge_total(challenge: CommunityChallenge) -> int:
@@ -98,20 +85,13 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
         return [entry async for entry in qs]
 
     # ------------------------------------------------------------------
-    # Progress contribution
+    # Progress tracking
     # ------------------------------------------------------------------
 
     async def add_progress(
-        self,
-        challenge: CommunityChallenge,
-        player: Player,
-        amount: int = 1,
+        self, challenge: CommunityChallenge, player: Player, amount: int = 1
     ) -> int:
-        """
-        Increment a player's contribution to *challenge* by *amount*.
-        Returns the new community total for the challenge.
-        Thread-safe via select_for_update inside a transaction.
-        """
+        """Atomically increment player contribution. Returns new community total."""
 
         @sync_to_async
         def _update() -> int:
@@ -122,40 +102,27 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
                 entry.amount += amount
                 entry.save(update_fields=["amount", "last_updated"])
 
-            total = (
+            return (
                 ChallengeProgress.objects.filter(challenge=challenge).aggregate(
                     total=Sum("amount")
                 )["total"]
                 or 0
             )
-            return total
 
         return await _update()
 
     # ------------------------------------------------------------------
-    # Completion logic
+    # Completion
     # ------------------------------------------------------------------
 
-    async def check_and_complete(
-        self, challenge: CommunityChallenge, total: int
-    ) -> None:
-        """
-        If *total* has reached the challenge target, fire completion once.
-        All work is guarded by _completion_lock to stay async-safe.
-        """
-        if total < challenge.target_amount:
-            return
-        if challenge.completed:
+    async def check_and_complete(self, challenge: CommunityChallenge, total: int) -> None:
+        if total < challenge.target_amount or challenge.completed:
             return
 
         async with self._completion_lock:
-            # Re-check inside the lock to avoid double-completion.
             refreshed = await CommunityChallenge.objects.aget(pk=challenge.pk)
-            if refreshed.completed:
+            if refreshed.completed or challenge.pk in self._completing:
                 return
-            if challenge.pk in self._completing:
-                return
-
             self._completing.add(challenge.pk)
 
         try:
@@ -164,85 +131,56 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
             self._completing.discard(challenge.pk)
 
     async def _complete_challenge(self, challenge: CommunityChallenge) -> None:
-        """Mark completed, distribute rewards, and send announcement."""
-        log.info("Challenge '%s' completed! Processing rewards...", challenge.name)
+        log.info("Challenge '%s' reached its goal — completing.", challenge.name)
 
-        # Mark as completed in DB
         challenge.completed = True
         challenge.completed_at = timezone.now()
         await challenge.asave(update_fields=["completed", "completed_at"])
 
-        # Distribute rewards to all contributors
-        rewarded: List[int] = []
-        if challenge.reward_item:
-            contributors_qs = ChallengeProgress.objects.filter(
+        rewarded = 0
+        if challenge.reward_balls > 0:
+            async for entry in ChallengeProgress.objects.filter(
                 challenge=challenge, amount__gt=0
-            ).select_related("player")
-
-            async for entry in contributors_qs:
-                issued = await self._issue_reward(challenge, entry.player)
-                if issued:
-                    rewarded.append(entry.player.discord_id)
+            ).select_related("player"):
+                if await self._issue_reward(challenge, entry.player):
+                    rewarded += 1
 
         log.info(
-            "Challenge '%s': rewarded %d contributors with %d× %s.",
-            challenge.name,
-            len(rewarded),
-            challenge.reward_quantity,
-            challenge.reward_item or "(no reward item)",
+            "Challenge '%s' complete. Rewarded %d players with %d balls each.",
+            challenge.name, rewarded, challenge.reward_balls,
         )
+        await self._announce(challenge, rewarded)
 
-        # Announce
-        await self._announce_completion(challenge, len(rewarded))
-
-    async def _issue_reward(
-        self, challenge: CommunityChallenge, player: Player
-    ) -> bool:
+    async def _issue_reward(self, challenge: CommunityChallenge, player: Player) -> bool:
         """
-        Record a reward for *player*. Returns True if reward was newly issued.
-
-        NOTE: Extend this method to actually grant in-game items / currency
-        once your economy integration is ready. The ChallengeReward table
-        provides an idempotency guard so double-runs are safe.
+        Record reward issuance. Returns True if newly issued.
+        Extend this to actually grant balls via BallsDex economy hooks.
         """
         try:
             await ChallengeReward.objects.acreate(
                 challenge=challenge,
                 player=player,
-                reward_item=challenge.reward_item,
-                reward_quantity=challenge.reward_quantity,
-            )
-            log.debug(
-                "Reward issued: %s × %d → player %s",
-                challenge.reward_item,
-                challenge.reward_quantity,
-                player.discord_id,
+                balls_given=challenge.reward_balls,
             )
             return True
         except IntegrityError:
-            # Already rewarded (unique_together guard).
-            return False
+            return False  # already rewarded
 
-    async def _announce_completion(
-        self, challenge: CommunityChallenge, rewarded_count: int
-    ) -> None:
+    async def _announce(self, challenge: CommunityChallenge, rewarded: int) -> None:
         config = await ChallengeSettings.load()
         if not config.announcement_channel_id:
             return
 
         channel = self.bot.get_channel(config.announcement_channel_id)
         if not isinstance(channel, discord.TextChannel):
-            log.warning(
-                "Announcement channel %s not found or not a TextChannel.",
-                config.announcement_channel_id,
-            )
+            log.warning("Announcement channel %s not found.", config.announcement_channel_id)
             return
 
         emoji = _type_emoji(challenge.challenge_type)
         embed = discord.Embed(
-            title=f"🎉 Community Challenge Completed!",
+            title="🎉 Community Challenge Complete!",
             description=(
-                f"{emoji} **{challenge.name}** has been conquered by the community!\n\n"
+                f"{emoji} **{challenge.name}** has been beaten by the community!\n\n"
                 f"{challenge.description}"
             ),
             colour=discord.Colour.gold(),
@@ -252,17 +190,13 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
             value=f"{challenge.target_amount:,} {challenge.get_challenge_type_display()}s",
             inline=True,
         )
-        if challenge.reward_item:
+        if challenge.reward_balls:
             embed.add_field(
                 name="🎁 Reward",
-                value=f"{challenge.reward_quantity}× **{challenge.reward_item}**",
+                value=f"{challenge.reward_balls} ball(s) per contributor",
                 inline=True,
             )
-        embed.add_field(
-            name="👥 Contributors Rewarded",
-            value=f"{rewarded_count:,} players",
-            inline=True,
-        )
+        embed.add_field(name="👥 Rewarded", value=f"{rewarded:,} players", inline=True)
         embed.set_footer(text="Thanks to everyone who participated!")
 
         try:
@@ -271,36 +205,29 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
             log.error("Failed to send completion announcement: %s", exc)
 
     # ------------------------------------------------------------------
-    # Public event hook — call this from your ball-catching / trade listeners
+    # Public API — call from other cogs/listeners
     # ------------------------------------------------------------------
 
     async def record_contribution(
-        self,
-        player: Player,
-        contribution_type: str,
-        amount: int = 1,
+        self, player: Player, contribution_type: str, amount: int = 1
     ) -> None:
         """
-        Public API for other cogs/listeners to call when a player performs an
-        action. Pass ``contribution_type`` as one of the ChallengeType values
-        (e.g. "catch", "trade"). Matching active challenges are credited.
+        Credit *amount* to all active challenges matching *contribution_type*.
 
-        Example (from a catching listener)::
+        Call from your catching/trading listeners::
 
             cog = bot.cogs.get("challenge")
             if cog:
                 await cog.record_contribution(player, "catch")
         """
-        challenges = await self._active_challenges()
-        for challenge in challenges:
+        for challenge in await self._active_challenges():
             if challenge.challenge_type != contribution_type:
                 continue
-
             new_total = await self.add_progress(challenge, player, amount)
             await self.check_and_complete(challenge, new_total)
 
     # ------------------------------------------------------------------
-    # Slash commands
+    # Commands
     # ------------------------------------------------------------------
 
     @app_commands.command(name="view", description="View all active community challenges.")
@@ -315,51 +242,39 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
         challenges = await self._all_enabled_challenges()
         if not challenges:
             await interaction.response.send_message(
-                "There are no active challenges right now. Check back soon!",
-                ephemeral=True,
+                "No challenges are active right now. Check back soon!", ephemeral=True
             )
             return
 
         embed = discord.Embed(
             title="🏆 Community Challenges",
-            description="Work together to reach these goals and earn rewards!",
+            description="Work together to reach these goals!",
             colour=discord.Colour.blurple(),
         )
 
         for challenge in challenges:
             total = await self._challenge_total(challenge)
-            bar = _progress_bar(total, challenge.target_amount)
             emoji = _type_emoji(challenge.challenge_type)
-            status = "✅ Completed" if challenge.completed else f"{bar}"
-
-            field_value = (
+            status = "✅ Completed!" if challenge.completed else _progress_bar(total, challenge.target_amount)
+            value = (
                 f"{challenge.description}\n"
                 f"**Type:** {emoji} {challenge.get_challenge_type_display()}\n"
                 f"**Progress:** {total:,} / {challenge.target_amount:,}\n"
                 f"{status}"
             )
-            if challenge.reward_item:
-                field_value += (
-                    f"\n**Reward:** {challenge.reward_quantity}× {challenge.reward_item}"
-                )
-
-            embed.add_field(
-                name=challenge.name,
-                value=field_value,
-                inline=False,
-            )
+            if challenge.reward_balls:
+                value += f"\n**Reward:** {challenge.reward_balls} ball(s) per contributor"
+            embed.add_field(name=challenge.name, value=value, inline=False)
 
         embed.set_footer(text="Use /challenge leaderboard to see top contributors")
-        await interaction.response.send_message(embed=embed, ephemeral=False)
+        await interaction.response.send_message(embed=embed)
 
     @app_commands.command(
         name="leaderboard",
         description="See the top contributors for a community challenge.",
     )
-    @app_commands.describe(challenge_id="The challenge to view (use autocomplete).")
-    async def leaderboard(
-        self, interaction: Interaction, challenge_id: int
-    ) -> None:
+    @app_commands.describe(challenge_id="The challenge to view.")
+    async def leaderboard(self, interaction: Interaction, challenge_id: int) -> None:
         config = await ChallengeSettings.load()
         if not config.enabled:
             await interaction.response.send_message(
@@ -370,18 +285,15 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
         try:
             challenge = await CommunityChallenge.objects.aget(pk=challenge_id, enabled=True)
         except CommunityChallenge.DoesNotExist:
-            await interaction.response.send_message(
-                "Challenge not found. Use autocomplete to pick a valid one.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("Challenge not found.", ephemeral=True)
             return
 
         await interaction.response.defer()
 
         total = await self._challenge_total(challenge)
         top = await self._top_contributors(challenge, limit=10)
-
         emoji = _type_emoji(challenge.challenge_type)
+
         embed = discord.Embed(
             title=f"{emoji} {challenge.name} — Leaderboard",
             description=(
@@ -393,37 +305,21 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
         )
 
         if not top:
-            embed.add_field(
-                name="No contributions yet",
-                value="Be the first to contribute!",
-                inline=False,
-            )
+            embed.add_field(name="No contributions yet", value="Be the first!", inline=False)
         else:
             medals = ["🥇", "🥈", "🥉"]
-            lines: List[str] = []
+            lines = []
             for rank, entry in enumerate(top, start=1):
                 medal = medals[rank - 1] if rank <= 3 else f"`#{rank}`"
-                user_tag = f"<@{entry.player.discord_id}>"
-                lines.append(f"{medal} {user_tag} — **{entry.amount:,}**")
-
-            embed.add_field(
-                name="🏅 Top Contributors",
-                value="\n".join(lines),
-                inline=False,
-            )
+                lines.append(f"{medal} <@{entry.player.discord_id}> — **{entry.amount:,}**")
+            embed.add_field(name="🏅 Top Contributors", value="\n".join(lines), inline=False)
 
         if challenge.completed and challenge.completed_at:
-            embed.set_footer(
-                text=f"Completed on {challenge.completed_at.strftime('%B %d, %Y')}"
-            )
+            embed.set_footer(text=f"Completed {challenge.completed_at.strftime('%B %d, %Y')}")
         else:
-            embed.set_footer(text="Keep contributing to reach the goal!")
+            embed.set_footer(text="Keep contributing!")
 
         await interaction.followup.send(embed=embed)
-
-    # ------------------------------------------------------------------
-    # Autocomplete
-    # ------------------------------------------------------------------
 
     @leaderboard.autocomplete("challenge_id")
     async def autocomplete_challenge(
@@ -440,26 +336,14 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
         ][:25]
 
     # ------------------------------------------------------------------
-    # Listener examples — wire up to real BallsDex events as needed
+    # Event listener stubs — rename to match your BallsDex build's events
     # ------------------------------------------------------------------
 
     @commands.Cog.listener("on_ballsdex_ball_caught")
-    async def _on_ball_caught(
-        self, player: Player, ball_instance: BallInstance
-    ) -> None:
-        """
-        Example listener that credits 'catch' challenges whenever a ball is caught.
-        Hook name may differ in your BallsDex build — adjust as needed.
-        """
+    async def _on_ball_caught(self, player: Player, **kwargs) -> None:
         await self.record_contribution(player, "catch")
 
     @commands.Cog.listener("on_ballsdex_trade_completed")
-    async def _on_trade_completed(
-        self, player_a: Player, player_b: Player
-    ) -> None:
-        """
-        Example listener for 'trade' challenges.
-        Both players involved in a trade get credit.
-        """
+    async def _on_trade_completed(self, player_a: Player, player_b: Player, **kwargs) -> None:
         await self.record_contribution(player_a, "trade")
         await self.record_contribution(player_b, "trade")
