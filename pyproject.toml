@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "ballsdex-community-challenge"
 version = "0.0.0"
 
-description = "Community Challenge system for BallsDex v3 — cooperative goals with admin-panel configuration."
+description = "Community Challenge system for BallsDex v3"
 license = "MIT"
 authors = [
     { name = "Haymooed" },
@@ -14,5 +14,5 @@ authors = [
 readme = "README.md"
 
 dependencies = [
-    "ballsdex>=3.0.0",
+
 ]
