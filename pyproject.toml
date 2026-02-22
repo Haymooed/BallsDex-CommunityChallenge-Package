@@ -1,5 +1,18 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "marketdex-community-challenge"
+name = "ballsdex-community-challenge"
 version = "1.0.0"
 
-dependencies = []
+description = "Community Challenge system for BallsDex v3 — cooperative goals with admin-panel configuration."
+license = "MIT"
+authors = [
+    { name = "Haymooed" },
+]
+readme = "README.md"
+
+dependencies = [
+    "ballsdex>=3.0.0",
+]
