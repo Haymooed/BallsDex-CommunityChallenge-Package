@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import discord
 from asgiref.sync import sync_to_async
@@ -12,9 +10,10 @@ from discord import app_commands
 from discord.ext import commands
 from django.db import IntegrityError, transaction
 from django.db.models import Count, Sum
+from django.db.models.signals import post_save
 from django.utils import timezone
 
-from bd_models.models import Ball, BallInstance, Player, Special
+from bd_models.models import BallInstance, Player
 
 from community_challenge.models import (
     ChallengeProgress,
@@ -22,7 +21,6 @@ from community_challenge.models import (
     ChallengeSettings,
     CommunityChallenge,
     ChallengeType,
-    EVENT_TYPES,
     SNAPSHOT_TYPES,
 )
 
@@ -31,43 +29,6 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 Interaction = discord.Interaction["BallsDexBot"]
-
-
-# ---------------------------------------------------------------------------
-# Message parsing
-#
-# From the screenshot, the bot EDITS the spawn message to show the catch:
-#   "@haymooed You caught **Pink Popsicle**! (#660, -6%/-1%)"
-#
-# Key facts:
-#   • "@username" is a plain mention (not <@id>) — we resolve via BallInstance
-#   • Ball name is between ** **
-#   • Instance ID is #NUMBER — we query BallInstance(pk=NUMBER) for player/ball/special
-#   • The edit happens to the spawn message content (not an embed)
-#
-# Wrong guess message (separate bot message, not an edit):
-#   "That is not the correct name haymooed, try again!" (or similar)
-#
-# Trade completed (bot sends embed with title containing "trade" + "complete"):
-#   Mentions both players as <@id> in the embed footer or description.
-# ---------------------------------------------------------------------------
-
-# Matches: "@username You caught **Ball Name**! (#123, ...)"
-# Groups: ball_name, instance_id
-_RE_CATCH = re.compile(
-    r"You caught \*\*(?P<ball_name>[^*]+)\*\*[^(]*\(#(?P<instance_id>\d+)",
-    re.IGNORECASE,
-)
-
-# Wrong guess — "That is not the correct name haymooed" or "Wrong answer"
-_RE_WRONG = re.compile(
-    r"(?:that is not the correct name|wrong answer|incorrect)[^\n]*?(?P<username>\w+)",
-    re.IGNORECASE,
-)
-
-# Trade done embed title
-_RE_TRADE_DONE = re.compile(r"trade\s+(?:completed?|done|successful)", re.IGNORECASE)
-_RE_MENTION = re.compile(r"<@!?(?P<user_id>\d+)>")
 
 
 # ---------------------------------------------------------------------------
@@ -81,51 +42,28 @@ def _progress_bar(current: int, target: int, width: int = 20) -> str:
 
 
 TYPE_EMOJI: dict[str, str] = {
-    ChallengeType.CATCH_ANY:             "🎣",
-    ChallengeType.CATCH_SPECIFIC:        "🎯",
-    ChallengeType.CATCH_SPECIAL:         "✨",
-    ChallengeType.CATCH_SPECIFIC_SPECIAL:"🌟",
-    ChallengeType.GUESS_WRONG:           "❌",
-    ChallengeType.TRADE:                 "🔄",
-    ChallengeType.BALLS_OWNED:           "📦",
-    ChallengeType.UNIQUE_BALLS:          "🗂️",
-    ChallengeType.SPECIALS_OWNED:        "💫",
+    ChallengeType.CATCH_ANY:              "🎣",
+    ChallengeType.CATCH_SPECIFIC:         "🎯",
+    ChallengeType.CATCH_SPECIAL:          "✨",
+    ChallengeType.CATCH_SPECIFIC_SPECIAL: "🌟",
+    ChallengeType.GUESS_WRONG:            "❌",
+    ChallengeType.TRADE:                  "🔄",
+    ChallengeType.BALLS_OWNED:            "📦",
+    ChallengeType.UNIQUE_BALLS:           "🗂️",
+    ChallengeType.SPECIALS_OWNED:         "💫",
 }
 
 TYPE_LABEL: dict[str, str] = {
-    ChallengeType.CATCH_ANY:             "balls caught",
-    ChallengeType.CATCH_SPECIFIC:        "specific balls caught",
-    ChallengeType.CATCH_SPECIAL:         "specials caught",
-    ChallengeType.CATCH_SPECIFIC_SPECIAL:"specific specials caught",
-    ChallengeType.GUESS_WRONG:           "wrong guesses",
-    ChallengeType.TRADE:                 "trades completed",
-    ChallengeType.BALLS_OWNED:           "balls owned",
-    ChallengeType.UNIQUE_BALLS:          "unique ball types owned",
-    ChallengeType.SPECIALS_OWNED:        "specials owned",
+    ChallengeType.CATCH_ANY:              "balls caught",
+    ChallengeType.CATCH_SPECIFIC:         "specific balls caught",
+    ChallengeType.CATCH_SPECIAL:          "specials caught",
+    ChallengeType.CATCH_SPECIFIC_SPECIAL: "specific specials caught",
+    ChallengeType.GUESS_WRONG:            "wrong guesses",
+    ChallengeType.TRADE:                  "trades completed",
+    ChallengeType.BALLS_OWNED:            "balls owned",
+    ChallengeType.UNIQUE_BALLS:           "unique ball types owned",
+    ChallengeType.SPECIALS_OWNED:         "specials owned",
 }
-
-
-def _embed_text(message: discord.Message) -> str:
-    parts: list[str] = [message.content or ""]
-    for embed in message.embeds:
-        for piece in (embed.title, embed.description):
-            if piece:
-                parts.append(piece)
-        for field in embed.fields:
-            parts.append(f"{field.name or ''} {field.value or ''}")
-        if embed.footer and embed.footer.text:
-            parts.append(embed.footer.text)
-    return "\n".join(parts)
-
-
-@dataclass
-class CatchEvent:
-    instance_id: int
-    ball_id: int
-    player_id: int       # bd_models Player pk
-    discord_id: int      # Discord user ID
-    special_id: Optional[int]
-    is_special: bool
 
 
 # ---------------------------------------------------------------------------
@@ -142,77 +80,115 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
         self._cache: list[CommunityChallenge] = []
         self._cache_dirty: bool = True
 
+        # Connect Django signal — fires every time a BallInstance row is inserted
+        post_save.connect(self._on_ball_instance_saved, sender=BallInstance)
+
     async def cog_load(self) -> None:
         await self._refresh_cache()
 
-    # ------------------------------------------------------------------
-    # Cache
-    # ------------------------------------------------------------------
-
-    async def _refresh_cache(self) -> None:
-        self._cache = [
-            c async for c in CommunityChallenge.objects.filter(
-                enabled=True, completed=False
-            ).select_related("ball_filter", "special_filter")
-        ]
-        self._cache_dirty = False
-        log.debug("Challenge cache: %d active challenges.", len(self._cache))
-
-    def _invalidate_cache(self) -> None:
-        self._cache_dirty = True
-
-    async def _ensure_cache(self) -> list[CommunityChallenge]:
-        if self._cache_dirty:
-            await self._refresh_cache()
-        return self._cache
+    async def cog_unload(self) -> None:
+        post_save.disconnect(self._on_ball_instance_saved, sender=BallInstance)
 
     # ------------------------------------------------------------------
-    # DB totals
+    # Django signal receiver (called synchronously from ORM thread)
     # ------------------------------------------------------------------
 
-    @staticmethod
-    async def _challenge_total(challenge: CommunityChallenge) -> int:
-        ct = challenge.challenge_type
-        if ct == ChallengeType.BALLS_OWNED:
-            return await BallInstance.objects.acount()
-        if ct == ChallengeType.UNIQUE_BALLS:
-            r = await BallInstance.objects.values("ball_id").distinct().aaggregate(
-                count=Count("ball_id")
-            )
-            return r["count"] or 0
-        if ct == ChallengeType.SPECIALS_OWNED:
-            return await BallInstance.objects.filter(special__isnull=False).acount()
-        # Event-based
-        r = await ChallengeProgress.objects.filter(challenge=challenge).aaggregate(
-            total=Sum("amount")
+    def _on_ball_instance_saved(
+        self,
+        sender,
+        instance: BallInstance,
+        created: bool,
+        **kwargs,
+    ) -> None:
+        """
+        Fires on every BallInstance save. We only care about newly created rows.
+        Schedules async handling on the bot's event loop since Django signals
+        are synchronous.
+        """
+        if not created:
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._handle_new_ball(instance),
+            self.bot.loop,
         )
-        return r["total"] or 0
 
-    @staticmethod
-    async def _top_contributors(
-        challenge: CommunityChallenge, limit: int = 10
-    ) -> list[ChallengeProgress]:
-        return [
-            e async for e in ChallengeProgress.objects.filter(challenge=challenge)
-            .select_related("player")
-            .order_by("-amount")[:limit]
-        ]
+    # ------------------------------------------------------------------
+    # Core handler — called for every new BallInstance
+    # ------------------------------------------------------------------
+
+    async def _handle_new_ball(self, instance: BallInstance) -> None:
+        """
+        A new BallInstance was inserted. Credit all matching active challenges.
+        We get exact data directly from the ORM:
+          instance.player_id  — Player PK
+          instance.ball_id    — Ball PK
+          instance.special_id — Special PK, or None if not special
+        """
+        active = await self._ensure_cache()
+        if not active:
+            return
+
+        is_special = instance.special_id is not None
+
+        matching: list[CommunityChallenge] = []
+        for challenge in active:
+            ct = challenge.challenge_type
+
+            if ct == ChallengeType.CATCH_ANY:
+                matching.append(challenge)
+
+            elif ct == ChallengeType.CATCH_SPECIFIC:
+                if (
+                    challenge.ball_filter_id is not None
+                    and challenge.ball_filter_id == instance.ball_id
+                ):
+                    matching.append(challenge)
+
+            elif ct == ChallengeType.CATCH_SPECIAL:
+                if is_special:
+                    matching.append(challenge)
+
+            elif ct == ChallengeType.CATCH_SPECIFIC_SPECIAL:
+                if is_special:
+                    # No specific special required → any special counts
+                    if challenge.special_filter_id is None:
+                        matching.append(challenge)
+                    elif challenge.special_filter_id == instance.special_id:
+                        matching.append(challenge)
+
+        if not matching:
+            return
+
+        try:
+            player = await Player.objects.aget(pk=instance.player_id)
+        except Player.DoesNotExist:
+            log.warning(
+                "CommunityChallenges: Player pk=%s not found for BallInstance pk=%s",
+                instance.player_id, instance.pk,
+            )
+            return
+
+        for challenge in matching:
+            total = await self._add_progress(challenge, player)
+            await self.check_and_complete(challenge, total)
 
     # ------------------------------------------------------------------
     # Progress tracking
     # ------------------------------------------------------------------
 
-    async def add_progress(
+    async def _add_progress(
         self,
         challenge: CommunityChallenge,
         player: Player,
         amount: int = 1,
     ) -> int:
-        @sync_to_async
-        def _update() -> int:
+        """Atomically increment and return the new community total."""
+        def _sync() -> int:
             with transaction.atomic():
                 entry, _ = ChallengeProgress.objects.select_for_update().get_or_create(
-                    challenge=challenge, player=player, defaults={"amount": 0}
+                    challenge=challenge,
+                    player=player,
+                    defaults={"amount": 0},
                 )
                 entry.amount += amount
                 entry.save(update_fields=["amount", "last_updated"])
@@ -221,83 +197,35 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
                 .aggregate(total=Sum("amount"))["total"]
                 or 0
             )
-        return await _update()
+        return await sync_to_async(_sync)()
 
-    def _catch_matches_challenge(
-        self, challenge: CommunityChallenge, event: CatchEvent
-    ) -> bool:
-        """Return True if this catch event satisfies the challenge's type and filters."""
+    # ------------------------------------------------------------------
+    # Snapshot challenges (live DB totals, updated on /challenge view)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _challenge_total(challenge: CommunityChallenge) -> int:
         ct = challenge.challenge_type
-
-        if ct == ChallengeType.CATCH_ANY:
-            return True
-
-        if ct == ChallengeType.CATCH_SPECIFIC:
-            # Must have a ball_filter set and it must match
-            return (
-                challenge.ball_filter_id is not None
-                and challenge.ball_filter_id == event.ball_id
+        if ct == ChallengeType.BALLS_OWNED:
+            return await BallInstance.objects.acount()
+        if ct == ChallengeType.UNIQUE_BALLS:
+            r = await (
+                BallInstance.objects.values("ball_id").distinct()
+                .aaggregate(count=Count("ball_id"))
             )
-
-        if ct == ChallengeType.CATCH_SPECIAL:
-            return event.is_special
-
-        if ct == ChallengeType.CATCH_SPECIFIC_SPECIAL:
-            if not event.is_special:
-                return False
-            if challenge.special_filter_id is None:
-                # No specific special required — any special counts
-                return True
-            return challenge.special_filter_id == event.special_id
-
-        return False
-
-    async def handle_catch(self, event: CatchEvent) -> None:
-        """Credit all matching active challenges for a catch event."""
-        active = await self._ensure_cache()
-        catch_challenges = [
-            c for c in active
-            if c.challenge_type in (
-                ChallengeType.CATCH_ANY,
-                ChallengeType.CATCH_SPECIFIC,
-                ChallengeType.CATCH_SPECIAL,
-                ChallengeType.CATCH_SPECIFIC_SPECIAL,
-            )
-        ]
-        if not catch_challenges:
-            return
-
-        player = await Player.objects.aget(pk=event.player_id)
-        for challenge in catch_challenges:
-            if self._catch_matches_challenge(challenge, event):
-                total = await self.add_progress(challenge, player)
-                await self.check_and_complete(challenge, total)
-
-    async def handle_wrong_guess(self, discord_id: int) -> None:
-        active = await self._ensure_cache()
-        matching = [c for c in active if c.challenge_type == ChallengeType.GUESS_WRONG]
-        if not matching:
-            return
-        player, _ = await Player.objects.aget_or_create(discord_id=discord_id)
-        for challenge in matching:
-            total = await self.add_progress(challenge, player)
-            await self.check_and_complete(challenge, total)
-
-    async def handle_trade(self, discord_ids: list[int]) -> None:
-        active = await self._ensure_cache()
-        matching = [c for c in active if c.challenge_type == ChallengeType.TRADE]
-        if not matching:
-            return
-        for discord_id in discord_ids:
-            player, _ = await Player.objects.aget_or_create(discord_id=discord_id)
-            for challenge in matching:
-                total = await self.add_progress(challenge, player)
-                await self.check_and_complete(challenge, total)
+            return r["count"] or 0
+        if ct == ChallengeType.SPECIALS_OWNED:
+            return await BallInstance.objects.filter(special__isnull=False).acount()
+        # Event-based: sum progress rows
+        r = await ChallengeProgress.objects.filter(challenge=challenge).aaggregate(
+            total=Sum("amount")
+        )
+        return r["total"] or 0
 
     async def check_snapshot_challenges(self) -> None:
         active = await self._ensure_cache()
         for challenge in active:
-            if challenge.is_snapshot:
+            if challenge.challenge_type in SNAPSHOT_TYPES:
                 total = await self._challenge_total(challenge)
                 await self.check_and_complete(challenge, total)
 
@@ -336,7 +264,7 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
                     rewarded += 1
 
         log.info(
-            "Challenge '%s' done — rewarded %d players with %d ball(s) each.",
+            "Challenge '%s' complete — rewarded %d players with %d ball(s) each.",
             challenge.name, rewarded, challenge.reward_balls,
         )
         await self._announce(challenge, rewarded)
@@ -360,7 +288,6 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
         if not isinstance(channel, discord.TextChannel):
             log.warning("Announcement channel %s not found.", config.announcement_channel_id)
             return
-
         emoji = TYPE_EMOJI.get(challenge.challenge_type, "🏆")
         label = TYPE_LABEL.get(challenge.challenge_type, "actions")
         embed = discord.Embed(
@@ -368,17 +295,9 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
             description=f"{emoji} **{challenge.name}** has been beaten!\n\n{challenge.description}",
             colour=discord.Colour.gold(),
         )
-        embed.add_field(
-            name="🏆 Goal",
-            value=f"{challenge.target_amount:,} {label}",
-            inline=True,
-        )
+        embed.add_field(name="🏆 Goal", value=f"{challenge.target_amount:,} {label}", inline=True)
         if challenge.reward_balls:
-            embed.add_field(
-                name="🎁 Reward",
-                value=f"{challenge.reward_balls} ball(s) per contributor",
-                inline=True,
-            )
+            embed.add_field(name="🎁 Reward", value=f"{challenge.reward_balls} ball(s) per contributor", inline=True)
         embed.add_field(name="👥 Rewarded", value=f"{rewarded:,} players", inline=True)
         embed.set_footer(text="Thanks to everyone who participated!")
         try:
@@ -387,92 +306,25 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
             log.error("Failed to send completion announcement: %s", exc)
 
     # ------------------------------------------------------------------
-    # Discord event listeners
+    # Cache
     # ------------------------------------------------------------------
 
-    @commands.Cog.listener()
-    async def on_message_edit(
-        self, before: discord.Message, after: discord.Message
-    ) -> None:
-        """
-        BallsDex edits the spawn message when a ball is caught:
-          Before: "Pink Popsicle just spawned. Quickly type its name..."
-          After:  "@haymooed You caught **Pink Popsicle**! (#660, -6%/-1%)"
+    async def _refresh_cache(self) -> None:
+        self._cache = [
+            c async for c in CommunityChallenge.objects.filter(
+                enabled=True, completed=False
+            ).select_related("ball_filter", "special_filter")
+        ]
+        self._cache_dirty = False
+        log.debug("Challenge cache refreshed: %d active challenges.", len(self._cache))
 
-        We detect the edit, extract the BallInstance ID, then look up
-        player + ball + special from the database.
-        """
-        if not self.bot.user or after.author.id != self.bot.user.id:
-            return
-        if not after.guild:
-            return
+    def _invalidate_cache(self) -> None:
+        self._cache_dirty = True
 
-        # Only process edits that added a catch confirmation
-        text = after.content or ""
-        if "You caught" not in text:
-            return
-        # Make sure it wasn't already processed (before also had "You caught")
-        if before.content and "You caught" in before.content:
-            return
-
-        match = _RE_CATCH.search(text)
-        if not match:
-            return
-
-        instance_id = int(match.group("instance_id"))
-
-        # Look up the BallInstance to get player + ball + special
-        try:
-            instance = await BallInstance.objects.select_related(
-                "player", "ball", "special"
-            ).aget(pk=instance_id)
-        except BallInstance.DoesNotExist:
-            log.warning("BallInstance #%d not found after catch edit.", instance_id)
-            return
-
-        event = CatchEvent(
-            instance_id=instance_id,
-            ball_id=instance.ball_id,
-            player_id=instance.player_id,
-            discord_id=instance.player.discord_id,
-            special_id=instance.special_id,
-            is_special=instance.special_id is not None,
-        )
-
-        await self.handle_catch(event)
-
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message) -> None:
-        """Handles wrong guesses and trade completions (separate bot messages, not edits)."""
-        if not self.bot.user or message.author.id != self.bot.user.id:
-            return
-        if not message.guild:
-            return
-
-        active = await self._ensure_cache()
-        text = _embed_text(message)
-        if not text:
-            return
-
-        # ── Wrong guess ───────────────────────────────────────────────
-        if any(c.challenge_type == ChallengeType.GUESS_WRONG for c in active):
-            wrong_match = _RE_WRONG.search(text)
-            if wrong_match:
-                # Wrong guess messages don't include a user ID, only username.
-                # We can't reliably map username → discord_id without fetching guild members.
-                # Best effort: look for any <@id> mention in the message.
-                mention = _RE_MENTION.search(text)
-                if mention:
-                    await self.handle_wrong_guess(int(mention.group("user_id")))
-                # If no mention found, we skip — can't safely credit an unknown user.
-                return
-
-        # ── Trade completed ───────────────────────────────────────────
-        if any(c.challenge_type == ChallengeType.TRADE for c in active):
-            if _RE_TRADE_DONE.search(text):
-                ids = list({int(m.group("user_id")) for m in _RE_MENTION.finditer(text)})
-                if ids:
-                    await self.handle_trade(ids)
+    async def _ensure_cache(self) -> list[CommunityChallenge]:
+        if self._cache_dirty:
+            await self._refresh_cache()
+        return self._cache
 
     # ------------------------------------------------------------------
     # Commands
@@ -503,20 +355,18 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
             description="Work together to reach these community goals!",
             colour=discord.Colour.blurple(),
         )
-
         for challenge in challenges:
             total = await self._challenge_total(challenge)
             emoji = TYPE_EMOJI.get(challenge.challenge_type, "🏆")
             label = TYPE_LABEL.get(challenge.challenge_type, "actions")
             status = "✅ **Completed!**" if challenge.completed else _progress_bar(total, challenge.target_amount)
 
-            # Build filter description
             filters: list[str] = []
             if challenge.ball_filter:
                 filters.append(f"Ball: **{challenge.ball_filter.country}**")
             if challenge.special_filter:
                 filters.append(f"Special: **{challenge.special_filter.name}**")
-            filter_line = f"\n{' • '.join(filters)}" if filters else ""
+            filter_line = ("\n" + " • ".join(filters)) if filters else ""
 
             value = (
                 f"{challenge.description}{filter_line}\n"
@@ -526,20 +376,12 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
             )
             if challenge.reward_balls:
                 value += f"\n**Reward:** {challenge.reward_balls} ball(s) per contributor"
-
-            embed.add_field(
-                name=f"{emoji} {challenge.name}",
-                value=value,
-                inline=False,
-            )
+            embed.add_field(name=f"{emoji} {challenge.name}", value=value, inline=False)
 
         embed.set_footer(text="Use /challenge leaderboard to see top contributors")
         await interaction.followup.send(embed=embed)
 
-    @app_commands.command(
-        name="leaderboard",
-        description="Top contributors for a community challenge.",
-    )
+    @app_commands.command(name="leaderboard", description="Top contributors for a community challenge.")
     @app_commands.describe(challenge_id="Which challenge to inspect.")
     async def leaderboard(self, interaction: Interaction, challenge_id: int) -> None:
         config = await ChallengeSettings.load()
@@ -559,11 +401,14 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
 
         await interaction.response.defer()
         total = await self._challenge_total(challenge)
-        top = await self._top_contributors(challenge, limit=10)
+        top = [
+            e async for e in ChallengeProgress.objects.filter(challenge=challenge)
+            .select_related("player")
+            .order_by("-amount")[:10]
+        ]
         emoji = TYPE_EMOJI.get(challenge.challenge_type, "🏆")
         label = TYPE_LABEL.get(challenge.challenge_type, "actions")
 
-        # Filter description
         filters: list[str] = []
         if challenge.ball_filter:
             filters.append(f"Ball: **{challenge.ball_filter.country}**")
@@ -582,7 +427,7 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
             colour=discord.Colour.gold() if challenge.completed else discord.Colour.blurple(),
         )
 
-        if challenge.is_snapshot:
+        if challenge.challenge_type in SNAPSHOT_TYPES:
             embed.add_field(
                 name="ℹ️ Snapshot Challenge",
                 value="This challenge measures a live database total, not individual events.",
@@ -614,9 +459,7 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
     async def _autocomplete_challenge(
         self, interaction: Interaction, current: str
     ) -> list[app_commands.Choice[int]]:
-        challenges = [
-            c async for c in CommunityChallenge.objects.filter(enabled=True)
-        ]
+        challenges = [c async for c in CommunityChallenge.objects.filter(enabled=True)]
         return [
             app_commands.Choice(
                 name=f"{'✅ ' if c.completed else ''}{c.name} ({c.get_challenge_type_display()})",
