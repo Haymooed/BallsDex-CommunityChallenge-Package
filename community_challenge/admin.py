@@ -21,9 +21,12 @@ class ChallengeProgressInline(admin.TabularInline):
     readonly_fields = ("player", "amount", "last_updated")
     can_delete = False
     ordering = ("-amount",)
+    max_num = 25
 
     def get_queryset(self, request):
-        return super().get_queryset(request).order_by("-amount")[:25]
+        # Do NOT slice here — Django filters the qs after this call.
+        # max_num=25 limits display rows instead.
+        return super().get_queryset(request).order_by("-amount")
 
 
 @admin.register(CommunityChallenge)
