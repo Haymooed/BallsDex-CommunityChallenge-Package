@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from typing import TYPE_CHECKING
 
 import discord
@@ -13,7 +14,7 @@ from django.db.models import Count, Sum
 from django.db.models.signals import post_save
 from django.utils import timezone
 
-from bd_models.models import BallInstance, Player
+from bd_models.models import Ball, BallInstance, Player
 
 from community_challenge.models import (
     ChallengeProgress,
@@ -270,14 +271,43 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
         await self._announce(challenge, rewarded)
 
     async def _issue_reward(self, challenge: CommunityChallenge, player: Player) -> bool:
+        """Issue rewards to a player by creating actual BallInstance objects."""
+        from ballsdex.settings import settings
+        
         try:
+            # Record that we're giving the reward
             await ChallengeReward.objects.acreate(
                 challenge=challenge,
                 player=player,
                 balls_given=challenge.reward_balls,
             )
+            
+            # Get all enabled balls for random selection
+            enabled_balls = await Ball.objects.filter(enabled=True).all()
+            if not enabled_balls:
+                log.error("No enabled balls available for rewards!")
+                return False
+            
+            # Create the actual ball instances
+            for _ in range(challenge.reward_balls):
+                # Pick a random ball
+                ball = random.choice(enabled_balls)
+                
+                # Create the ball instance with random stats
+                await BallInstance.objects.acreate(
+                    ball=ball,
+                    player=player,
+                    attack_bonus=random.randint(-settings.max_attack_bonus, settings.max_attack_bonus),
+                    health_bonus=random.randint(-settings.max_health_bonus, settings.max_health_bonus),
+                    special=None,  # No special for challenge rewards
+                )
+            
             return True
         except IntegrityError:
+            # Already rewarded
+            return False
+        except Exception as e:
+            log.error(f"Error issuing reward to player {player.discord_id}: {e}")
             return False
 
     async def _announce(self, challenge: CommunityChallenge, rewarded: int) -> None:
