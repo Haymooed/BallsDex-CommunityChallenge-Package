@@ -60,9 +60,16 @@ class ChallengeSettings(models.Model):
         return "Challenge Settings"
 
     @classmethod
-    async def load(cls) -> "ChallengeSettings":
-        instance, _ = await cls.objects.aget_or_create(pk=1)
+    def load_sync(cls) -> "ChallengeSettings":
+        """Synchronous version — use inside sync_to_async blocks."""
+        instance, _ = cls.objects.get_or_create(pk=1)
         return instance
+
+    @classmethod
+    async def load(cls) -> "ChallengeSettings":
+        """Async convenience wrapper."""
+        from asgiref.sync import sync_to_async
+        return await sync_to_async(cls.load_sync)()
 
 
 class CommunityChallenge(models.Model):

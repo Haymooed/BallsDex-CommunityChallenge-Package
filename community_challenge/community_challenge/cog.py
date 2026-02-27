@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import random
 from typing import TYPE_CHECKING
 
 import discord
@@ -10,11 +9,11 @@ from asgiref.sync import sync_to_async
 from discord import app_commands
 from discord.ext import commands
 from django.db import IntegrityError, transaction
-from django.db.models import Count, Sum
+from django.db.models import Sum
 from django.db.models.signals import post_save
 from django.utils import timezone
 
-from bd_models.models import Ball, BallInstance, Player
+from bd_models.models import BallInstance, Player
 
 from community_challenge.models import (
     ChallengeProgress,
@@ -68,6 +67,44 @@ TYPE_LABEL: dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
+# Module-level signal receiver
+#
+# CRITICAL: This must be a plain module-level function, NOT a bound method.
+#
+# Django signals store receivers as weak references by default.
+# If you pass `self._some_method`, that bound method object has no other
+# references, so Python's garbage collector destroys it almost immediately.
+# The signal fires but the receiver is already gone — nothing happens.
+#
+# Using a module-level function AND passing weak=False to post_save.connect()
+# ensures the receiver is never collected.
+# ---------------------------------------------------------------------------
+
+_cog_ref: "CommunityChallenges | None" = None
+
+
+def _ball_instance_post_save(
+    sender,
+    instance: BallInstance,
+    created: bool,
+    **kwargs,
+) -> None:
+    """
+    Fires on every BallInstance save. We only care about newly-created rows.
+    Bridges the synchronous Django signal into the async bot event loop.
+    """
+    if not created:
+        return
+    cog = _cog_ref
+    if cog is None:
+        return
+    asyncio.run_coroutine_threadsafe(
+        cog._handle_new_ball(instance),
+        cog.bot.loop,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Cog
 # ---------------------------------------------------------------------------
 
@@ -81,55 +118,42 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
         self._cache: list[CommunityChallenge] = []
         self._cache_dirty: bool = True
 
-        # Connect Django signal — fires every time a BallInstance row is inserted
-        post_save.connect(self._on_ball_instance_saved, sender=BallInstance)
-
     async def cog_load(self) -> None:
+        global _cog_ref
+        _cog_ref = self
+        # weak=False is mandatory — without it Django drops the receiver immediately
+        post_save.connect(_ball_instance_post_save, sender=BallInstance, weak=False)
+        log.info(
+            "CommunityChallenges: post_save connected on BallInstance (weak=False)."
+        )
         await self._refresh_cache()
 
     async def cog_unload(self) -> None:
-        post_save.disconnect(self._on_ball_instance_saved, sender=BallInstance)
+        global _cog_ref
+        _cog_ref = None
+        post_save.disconnect(_ball_instance_post_save, sender=BallInstance)
+        log.info("CommunityChallenges: post_save disconnected from BallInstance.")
 
     # ------------------------------------------------------------------
-    # Django signal receiver (called synchronously from ORM thread)
-    # ------------------------------------------------------------------
-
-    def _on_ball_instance_saved(
-        self,
-        sender,
-        instance: BallInstance,
-        created: bool,
-        **kwargs,
-    ) -> None:
-        """
-        Fires on every BallInstance save. We only care about newly created rows.
-        Schedules async handling on the bot's event loop since Django signals
-        are synchronous.
-        """
-        if not created:
-            return
-        asyncio.run_coroutine_threadsafe(
-            self._handle_new_ball(instance),
-            self.bot.loop,
-        )
-
-    # ------------------------------------------------------------------
-    # Core handler — called for every new BallInstance
+    # Core handler
     # ------------------------------------------------------------------
 
     async def _handle_new_ball(self, instance: BallInstance) -> None:
         """
-        A new BallInstance was inserted. Credit all matching active challenges.
-        We get exact data directly from the ORM:
-          instance.player_id  — Player PK
-          instance.ball_id    — Ball PK
-          instance.special_id — Special PK, or None if not special
+        Called for every new BallInstance row.
+        instance.ball_id    → Ball PK (int)
+        instance.player_id  → Player PK (int)
+        instance.special_id → Special PK (int) or None
         """
         active = await self._ensure_cache()
         if not active:
             return
 
         is_special = instance.special_id is not None
+        log.debug(
+            "CommunityChallenges: new BallInstance pk=%s ball_id=%s special_id=%s player_id=%s",
+            instance.pk, instance.ball_id, instance.special_id, instance.player_id,
+        )
 
         matching: list[CommunityChallenge] = []
         for challenge in active:
@@ -151,7 +175,6 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
 
             elif ct == ChallengeType.CATCH_SPECIFIC_SPECIAL:
                 if is_special:
-                    # No specific special required → any special counts
                     if challenge.special_filter_id is None:
                         matching.append(challenge)
                     elif challenge.special_filter_id == instance.special_id:
@@ -171,10 +194,14 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
 
         for challenge in matching:
             total = await self._add_progress(challenge, player)
+            log.info(
+                "CommunityChallenges: '%s' → %d / %d",
+                challenge.name, total, challenge.target_amount,
+            )
             await self.check_and_complete(challenge, total)
 
     # ------------------------------------------------------------------
-    # Progress tracking
+    # Progress
     # ------------------------------------------------------------------
 
     async def _add_progress(
@@ -183,7 +210,6 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
         player: Player,
         amount: int = 1,
     ) -> int:
-        """Atomically increment and return the new community total."""
         def _sync() -> int:
             with transaction.atomic():
                 entry, _ = ChallengeProgress.objects.select_for_update().get_or_create(
@@ -201,31 +227,29 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
         return await sync_to_async(_sync)()
 
     # ------------------------------------------------------------------
-    # Snapshot challenges (live DB totals, updated on /challenge view)
+    # Snapshot challenges
     # ------------------------------------------------------------------
 
     @staticmethod
     async def _challenge_total(challenge: CommunityChallenge) -> int:
         ct = challenge.challenge_type
         if ct == ChallengeType.BALLS_OWNED:
-            return await BallInstance.objects.acount()
+            return await sync_to_async(BallInstance.objects.count)()
         if ct == ChallengeType.UNIQUE_BALLS:
-            r = await (
-                BallInstance.objects.values("ball_id").distinct()
-                .aaggregate(count=Count("ball_id"))
-            )
-            return r["count"] or 0
+            qs = BallInstance.objects.values("ball_id").distinct()
+            return await sync_to_async(qs.count)()
         if ct == ChallengeType.SPECIALS_OWNED:
-            return await BallInstance.objects.filter(special__isnull=False).acount()
-        # Event-based: sum progress rows
-        r = await ChallengeProgress.objects.filter(challenge=challenge).aaggregate(
-            total=Sum("amount")
-        )
-        return r["total"] or 0
+            qs = BallInstance.objects.filter(special__isnull=False)
+            return await sync_to_async(qs.count)()
+        def _sync() -> int:
+            r = ChallengeProgress.objects.filter(challenge=challenge).aggregate(
+                total=Sum("amount")
+            )
+            return r["total"] or 0
+        return await sync_to_async(_sync)()
 
     async def check_snapshot_challenges(self) -> None:
-        active = await self._ensure_cache()
-        for challenge in active:
+        for challenge in await self._ensure_cache():
             if challenge.challenge_type in SNAPSHOT_TYPES:
                 total = await self._challenge_total(challenge)
                 await self.check_and_complete(challenge, total)
@@ -240,7 +264,9 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
         if total < challenge.target_amount or challenge.completed:
             return
         async with self._completion_lock:
-            refreshed = await CommunityChallenge.objects.aget(pk=challenge.pk)
+            refreshed = await sync_to_async(
+                lambda: CommunityChallenge.objects.get(pk=challenge.pk)
+            )()
             if refreshed.completed or challenge.pk in self._completing:
                 return
             self._completing.add(challenge.pk)
@@ -252,63 +278,44 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
 
     async def _complete_challenge(self, challenge: CommunityChallenge) -> None:
         log.info("Community challenge '%s' reached its goal!", challenge.name)
-        challenge.completed = True
-        challenge.completed_at = timezone.now()
-        await challenge.asave(update_fields=["completed", "completed_at"])
+
+        def _mark():
+            challenge.completed = True
+            challenge.completed_at = timezone.now()
+            challenge.save(update_fields=["completed", "completed_at"])
+        await sync_to_async(_mark)()
 
         rewarded = 0
         if challenge.reward_balls > 0:
-            async for entry in ChallengeProgress.objects.filter(
-                challenge=challenge, amount__gt=0
-            ).select_related("player"):
+            entries = await sync_to_async(
+                lambda: list(
+                    ChallengeProgress.objects.filter(
+                        challenge=challenge, amount__gt=0
+                    ).select_related("player")
+                )
+            )()
+            for entry in entries:
                 if await self._issue_reward(challenge, entry.player):
                     rewarded += 1
 
         log.info(
-            "Challenge '%s' complete — rewarded %d players with %d ball(s) each.",
+            "Challenge '%s' complete — rewarded %d player(s) with %d ball(s) each.",
             challenge.name, rewarded, challenge.reward_balls,
         )
         await self._announce(challenge, rewarded)
 
     async def _issue_reward(self, challenge: CommunityChallenge, player: Player) -> bool:
-        """Issue rewards to a player by creating actual BallInstance objects."""
-        from ballsdex.settings import settings
-        
-        try:
-            # Record that we're giving the reward
-            await ChallengeReward.objects.acreate(
-                challenge=challenge,
-                player=player,
-                balls_given=challenge.reward_balls,
-            )
-            
-            # Get all enabled balls for random selection
-            enabled_balls = await Ball.objects.filter(enabled=True).all()
-            if not enabled_balls:
-                log.error("No enabled balls available for rewards!")
-                return False
-            
-            # Create the actual ball instances
-            for _ in range(challenge.reward_balls):
-                # Pick a random ball
-                ball = random.choice(enabled_balls)
-                
-                # Create the ball instance with random stats
-                await BallInstance.objects.acreate(
-                    ball=ball,
+        def _sync():
+            try:
+                ChallengeReward.objects.create(
+                    challenge=challenge,
                     player=player,
-                    attack_bonus=random.randint(-settings.max_attack_bonus, settings.max_attack_bonus),
-                    health_bonus=random.randint(-settings.max_health_bonus, settings.max_health_bonus),
-                    special=None,  # No special for challenge rewards
+                    balls_given=challenge.reward_balls,
                 )
-            
-            return True
-        except IntegrityError:
-            # Already rewarded
-            return False
-        except Exception as e:
-            log.error(f"Error issuing reward to player {player.discord_id}: {e}")
-            return False
+                return True
+            except IntegrityError:
+                return False
+        return await sync_to_async(_sync)()
 
     async def _announce(self, challenge: CommunityChallenge, rewarded: int) -> None:
         config = await ChallengeSettings.load()
@@ -327,7 +334,11 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
         )
         embed.add_field(name="🏆 Goal", value=f"{challenge.target_amount:,} {label}", inline=True)
         if challenge.reward_balls:
-            embed.add_field(name="🎁 Reward", value=f"{challenge.reward_balls} ball(s) per contributor", inline=True)
+            embed.add_field(
+                name="🎁 Reward",
+                value=f"{challenge.reward_balls} ball(s) per contributor",
+                inline=True,
+            )
         embed.add_field(name="👥 Rewarded", value=f"{rewarded:,} players", inline=True)
         embed.set_footer(text="Thanks to everyone who participated!")
         try:
@@ -340,13 +351,17 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
     # ------------------------------------------------------------------
 
     async def _refresh_cache(self) -> None:
-        self._cache = [
-            c async for c in CommunityChallenge.objects.filter(
-                enabled=True, completed=False
-            ).select_related("ball_filter", "special_filter")
-        ]
+        self._cache = await sync_to_async(
+            lambda: list(
+                CommunityChallenge.objects.filter(enabled=True, completed=False)
+                .select_related("ball_filter", "special_filter")
+            )
+        )()
         self._cache_dirty = False
-        log.debug("Challenge cache refreshed: %d active challenges.", len(self._cache))
+        log.debug(
+            "CommunityChallenges: cache refreshed — %d active challenge(s).",
+            len(self._cache),
+        )
 
     def _invalidate_cache(self) -> None:
         self._cache_dirty = True
@@ -372,10 +387,13 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
         await interaction.response.defer()
         await self.check_snapshot_challenges()
 
-        challenges = [
-            c async for c in CommunityChallenge.objects.filter(enabled=True)
-            .select_related("ball_filter", "special_filter")
-        ]
+        challenges = await sync_to_async(
+            lambda: list(
+                CommunityChallenge.objects.filter(enabled=True)
+                .select_related("ball_filter", "special_filter")
+            )
+        )()
+
         if not challenges:
             await interaction.followup.send("No challenges active right now. Check back soon!")
             return
@@ -389,15 +407,17 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
             total = await self._challenge_total(challenge)
             emoji = TYPE_EMOJI.get(challenge.challenge_type, "🏆")
             label = TYPE_LABEL.get(challenge.challenge_type, "actions")
-            status = "✅ **Completed!**" if challenge.completed else _progress_bar(total, challenge.target_amount)
-
+            status = (
+                "✅ **Completed!**"
+                if challenge.completed
+                else _progress_bar(total, challenge.target_amount)
+            )
             filters: list[str] = []
             if challenge.ball_filter:
                 filters.append(f"Ball: **{challenge.ball_filter.country}**")
             if challenge.special_filter:
                 filters.append(f"Special: **{challenge.special_filter.name}**")
             filter_line = ("\n" + " • ".join(filters)) if filters else ""
-
             value = (
                 f"{challenge.description}{filter_line}\n"
                 f"**Type:** {emoji} {challenge.get_challenge_type_display()}\n"
@@ -411,7 +431,10 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
         embed.set_footer(text="Use /challenge leaderboard to see top contributors")
         await interaction.followup.send(embed=embed)
 
-    @app_commands.command(name="leaderboard", description="Top contributors for a community challenge.")
+    @app_commands.command(
+        name="leaderboard",
+        description="Top contributors for a community challenge.",
+    )
     @app_commands.describe(challenge_id="Which challenge to inspect.")
     async def leaderboard(self, interaction: Interaction, challenge_id: int) -> None:
         config = await ChallengeSettings.load()
@@ -421,24 +444,31 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
             )
             return
 
-        try:
-            challenge = await CommunityChallenge.objects.select_related(
-                "ball_filter", "special_filter"
-            ).aget(pk=challenge_id, enabled=True)
-        except CommunityChallenge.DoesNotExist:
+        def _get():
+            try:
+                return CommunityChallenge.objects.select_related(
+                    "ball_filter", "special_filter"
+                ).get(pk=challenge_id, enabled=True)
+            except CommunityChallenge.DoesNotExist:
+                return None
+
+        challenge = await sync_to_async(_get)()
+        if challenge is None:
             await interaction.response.send_message("Challenge not found.", ephemeral=True)
             return
 
         await interaction.response.defer()
         total = await self._challenge_total(challenge)
-        top = [
-            e async for e in ChallengeProgress.objects.filter(challenge=challenge)
-            .select_related("player")
-            .order_by("-amount")[:10]
-        ]
+        top = await sync_to_async(
+            lambda: list(
+                ChallengeProgress.objects.filter(challenge=challenge)
+                .select_related("player")
+                .order_by("-amount")[:10]
+            )
+        )()
+
         emoji = TYPE_EMOJI.get(challenge.challenge_type, "🏆")
         label = TYPE_LABEL.get(challenge.challenge_type, "actions")
-
         filters: list[str] = []
         if challenge.ball_filter:
             filters.append(f"Ball: **{challenge.ball_filter.country}**")
@@ -467,7 +497,7 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
         if not top:
             embed.add_field(
                 name="No contributions yet",
-                value="Start catching or trading to appear here!",
+                value="Start catching to appear here!",
                 inline=False,
             )
         else:
@@ -489,7 +519,9 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
     async def _autocomplete_challenge(
         self, interaction: Interaction, current: str
     ) -> list[app_commands.Choice[int]]:
-        challenges = [c async for c in CommunityChallenge.objects.filter(enabled=True)]
+        challenges = await sync_to_async(
+            lambda: list(CommunityChallenge.objects.filter(enabled=True))
+        )()
         return [
             app_commands.Choice(
                 name=f"{'✅ ' if c.completed else ''}{c.name} ({c.get_challenge_type_display()})",
