@@ -10,26 +10,12 @@ from discord import app_commands
 from discord.ext import commands
 from django.db import IntegrityError, transaction
 from django.db.models import Sum
+from django.db.models.signals import post_save
 from django.utils import timezone
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BallsDex v3 architecture:
-#
-#   ballsdex.core.models   → Tortoise ORM models  → used by the BOT at runtime
-#   bd_models.models       → Django mirror models → used by the ADMIN PANEL only
-#
-# Catches are created by the bot via Tortoise. Django knows nothing about it,
-# so django.db.models.signals.post_save NEVER fires.
-#
-# We must hook into the Tortoise signal on ballsdex.core.models.BallInstance.
-# Progress and challenge data use Django because our own models are Django.
-# ─────────────────────────────────────────────────────────────────────────────
-from ballsdex.core.models import BallInstance as TortoiseBallInstance
-from tortoise.signals import Signals
-
-# Django mirror — used for querying player/ball data from our Django models
-from bd_models.models import Player as DjangoPlayer
-from bd_models.models import BallInstance as DjangoBallInstance
+# In BallsDex v3, ALL bot code uses bd_models (Django ORM).
+# ballsdex.core.models does NOT exist in v3.
+from bd_models.models import BallInstance, Player
 
 from community_challenge.models import (
     ChallengeProgress,
@@ -83,28 +69,33 @@ TYPE_LABEL: dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
-# Tortoise post_save signal handler
+# Module-level signal receiver
 #
-# Must be a module-level async function registered with register_listener().
-# Tortoise calls this directly in the async event loop — no bridging needed.
+# MUST be a module-level function (not a bound method) and connected with
+# weak=False. If you pass a bound method, Django holds only a weak reference
+# to it, Python's GC destroys it almost instantly, and the signal silently
+# stops working. A module-level function lives forever.
 # ---------------------------------------------------------------------------
 
 _cog_ref: "CommunityChallenges | None" = None
 
 
-async def _on_ballinstance_post_save(
+def _ball_instance_post_save(
     sender,
-    instance: TortoiseBallInstance,
+    instance: BallInstance,
     created: bool,
-    using_db=None,
-    update_fields=None,
+    **kwargs,
 ) -> None:
+    """Fires on every BallInstance save. Bridges sync signal → async handler."""
     if not created:
         return
     cog = _cog_ref
     if cog is None:
         return
-    await cog._handle_new_ball(instance)
+    asyncio.run_coroutine_threadsafe(
+        cog._handle_new_ball(instance),
+        cog.bot.loop,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -124,31 +115,28 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
     async def cog_load(self) -> None:
         global _cog_ref
         _cog_ref = self
-        TortoiseBallInstance.register_listener(Signals.post_save, _on_ballinstance_post_save)
-        log.info("CommunityChallenges: registered Tortoise post_save on BallInstance.")
+        # weak=False is critical — without it the receiver is GC'd immediately
+        post_save.connect(_ball_instance_post_save, sender=BallInstance, weak=False)
+        log.info("CommunityChallenges: post_save connected on BallInstance (weak=False).")
         await self._refresh_cache()
 
     async def cog_unload(self) -> None:
         global _cog_ref
         _cog_ref = None
-        try:
-            TortoiseBallInstance._listeners[Signals.post_save].discard(_on_ballinstance_post_save)
-        except (AttributeError, KeyError):
-            pass
-        log.info("CommunityChallenges: unregistered Tortoise post_save from BallInstance.")
+        post_save.disconnect(_ball_instance_post_save, sender=BallInstance)
+        log.info("CommunityChallenges: post_save disconnected from BallInstance.")
 
     # ------------------------------------------------------------------
-    # Core signal handler
+    # Core handler
     # ------------------------------------------------------------------
 
-    async def _handle_new_ball(self, instance: TortoiseBallInstance) -> None:
+    async def _handle_new_ball(self, instance: BallInstance) -> None:
         """
-        Called by Tortoise signal every time a new BallInstance row is created.
-
-        Tortoise lazy-loads FKs, so access the raw _id fields:
-            instance.ball_id    (int)
-            instance.player_id  (int)
-            instance.special_id (int or None)
+        Called for every new BallInstance row.
+        Use the raw _id attributes to avoid extra queries:
+            instance.ball_id    → Ball PK
+            instance.player_id  → Player PK
+            instance.special_id → Special PK or None
         """
         active = await self._ensure_cache()
         if not active:
@@ -156,8 +144,8 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
 
         is_special = instance.special_id is not None
         log.debug(
-            "CommunityChallenges: new catch — ball_id=%s special_id=%s player_id=%s",
-            instance.ball_id, instance.special_id, instance.player_id,
+            "CommunityChallenges: new BallInstance pk=%s ball_id=%s special_id=%s player_id=%s",
+            instance.pk, instance.ball_id, instance.special_id, instance.player_id,
         )
 
         matching: list[CommunityChallenge] = []
@@ -188,36 +176,31 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
         if not matching:
             return
 
-        # Resolve the Django Player row via discord_id
-        # Tortoise Player has .discord_id; we need the Django Player for our FK
         try:
-            tortoise_player = await instance.player  # await to load the FK
-            player = await sync_to_async(DjangoPlayer.objects.get)(
-                discord_id=tortoise_player.discord_id
-            )
-        except Exception as exc:
+            player = await Player.objects.aget(pk=instance.player_id)
+        except Player.DoesNotExist:
             log.warning(
-                "CommunityChallenges: could not resolve player for BallInstance pk=%s: %s",
-                instance.pk, exc,
+                "CommunityChallenges: Player pk=%s not found for BallInstance pk=%s",
+                instance.player_id, instance.pk,
             )
             return
 
         for challenge in matching:
             total = await self._add_progress(challenge, player)
             log.info(
-                "CommunityChallenges: '%s' → %d / %d (player discord_id=%s)",
-                challenge.name, total, challenge.target_amount, tortoise_player.discord_id,
+                "CommunityChallenges: '%s' → %d / %d",
+                challenge.name, total, challenge.target_amount,
             )
             await self.check_and_complete(challenge, total)
 
     # ------------------------------------------------------------------
-    # Progress (Django ORM, run via sync_to_async)
+    # Progress
     # ------------------------------------------------------------------
 
     async def _add_progress(
         self,
         challenge: CommunityChallenge,
-        player: DjangoPlayer,
+        player: Player,
         amount: int = 1,
     ) -> int:
         def _sync() -> int:
@@ -244,14 +227,14 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
     async def _challenge_total(challenge: CommunityChallenge) -> int:
         ct = challenge.challenge_type
         if ct == ChallengeType.BALLS_OWNED:
-            return await sync_to_async(DjangoBallInstance.objects.count)()
+            return await sync_to_async(BallInstance.objects.count)()
         if ct == ChallengeType.UNIQUE_BALLS:
             return await sync_to_async(
-                lambda: DjangoBallInstance.objects.values("ball_id").distinct().count()
+                lambda: BallInstance.objects.values("ball_id").distinct().count()
             )()
         if ct == ChallengeType.SPECIALS_OWNED:
             return await sync_to_async(
-                lambda: DjangoBallInstance.objects.filter(special__isnull=False).count()
+                lambda: BallInstance.objects.filter(special__isnull=False).count()
             )()
         def _sync():
             r = ChallengeProgress.objects.filter(challenge=challenge).aggregate(
@@ -313,7 +296,7 @@ class CommunityChallenges(commands.GroupCog, name="challenge"):
         )
         await self._announce(challenge, rewarded)
 
-    async def _issue_reward(self, challenge: CommunityChallenge, player: DjangoPlayer) -> bool:
+    async def _issue_reward(self, challenge: CommunityChallenge, player: Player) -> bool:
         def _sync():
             try:
                 ChallengeReward.objects.create(
