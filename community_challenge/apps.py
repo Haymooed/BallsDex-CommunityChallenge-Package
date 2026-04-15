@@ -1,8 +1,9 @@
 from django.apps import AppConfig
 
+class CommunityChallengesConfig(AppConfig):
+    name = "community_challenges"
+    dpy_package = "community_challenges.ext"
 
-class CommunityChallengeConfig(AppConfig):
-    default_auto_field = "django.db.models.BigAutoField"
-    name = "community_challenge"
-    verbose_name = "Community Challenges"
-    dpy_package = "community_challenge.community_challenge"
+    def ready(self):
+        from . import patch
+        patch.apply_patches()
