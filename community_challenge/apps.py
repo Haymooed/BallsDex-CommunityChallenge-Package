@@ -1,8 +1,8 @@
 from django.apps import AppConfig
 
 class CommunityChallengesConfig(AppConfig):
-    name = "community_challenges"
-    dpy_package = "community_challenges.ext"
+    name = "community_challenge"
+    dpy_package = "community_challenge.community_challenge"
 
     def ready(self):
         from . import patch
