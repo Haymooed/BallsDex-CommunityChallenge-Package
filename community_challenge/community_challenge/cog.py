@@ -6,7 +6,7 @@ from django.utils import timezone
 import random
 
 from bd_models.models import Player, Ball, BallInstance
-from ..models import Challenge, ChallengeParticipant
+from ..models import Challenge, ChallengeParticipant, ChallengeReward
 
 if TYPE_CHECKING:
     from ballsdex.core.bot import BallsDexBot
@@ -17,10 +17,8 @@ class ChallengesCog(commands.GroupCog, group_name="challenges"):
 
     @commands.Cog.listener()
     async def on_challenge_score_add(self, discord_id: int, goal_type: str, amount: int = 1):
-        """Listens for the monkey-patched event and increments scores"""
         now = timezone.now()
         
-        # Async generator for active challenges of this specific type
         active_challenges = Challenge.objects.filter(
             active=True,
             start_time__lte=now,
@@ -47,7 +45,6 @@ class ChallengesCog(commands.GroupCog, group_name="challenges"):
 
     @app_commands.command(name="leaderboard")
     async def leaderboard(self, interaction: discord.Interaction["BallsDexBot"]):
-        """Show the current community challenge leaderboard."""
         now = timezone.now()
         challenge = await Challenge.objects.filter(active=True, start_time__lte=now, end_time__gte=now).afirst()
         
@@ -69,7 +66,6 @@ class ChallengesCog(commands.GroupCog, group_name="challenges"):
     @app_commands.command(name="distribute")
     @app_commands.default_permissions(administrator=True)
     async def distribute_rewards(self, interaction: discord.Interaction["BallsDexBot"], challenge_name: str):
-        """End a challenge and automatically distribute rewards to top finishers."""
         await interaction.response.defer(ephemeral=True)
         
         try:
@@ -77,33 +73,30 @@ class ChallengesCog(commands.GroupCog, group_name="challenges"):
         except Challenge.DoesNotExist:
             return await interaction.followup.send("Challenge not found.")
             
-        # Lock the challenge
         if challenge.active:
             challenge.active = False
             await challenge.asave()
             
+        # Get configured rewards and map them by rank
+        rewards_map = {}
+        async for reward in ChallengeReward.objects.filter(challenge=challenge):
+            if reward.rank not in rewards_map:
+                rewards_map[reward.rank] = []
+            rewards_map[reward.rank].append((reward.ball_id, reward.amount))
+            
         participants = ChallengeParticipant.objects.filter(challenge=challenge, score__gt=0).order_by('-score')
-        rewards_config = challenge.reward_config
         distributed_count = 0
-        
         rank = 1
+        
         async for part in participants:
-            reward = rewards_config.get(str(rank))
-            if reward:
-                player = part.player
-                
-                # 1. Distribute Currency
-                if "currency" in reward:
-                    # Note: Assumes Player model has a 'currency' field or equivalent logic 
-                    # specific to your merchant system
-                    player.currency += reward["currency"]
-                    await player.asave()
-                    
-                # 2. Distribute Balls from Prize Pool
-                if "balls" in reward:
-                    for ball_id in reward["balls"]:
-                        try:
-                            ball_obj = await Ball.objects.aget(id=ball_id)
+            player = part.player
+            
+            # Check if there are rewards configured for this rank position
+            if rank in rewards_map:
+                for ball_id, amount in rewards_map[rank]:
+                    try:
+                        ball_obj = await Ball.objects.aget(id=ball_id)
+                        for _ in range(amount):
                             await BallInstance.objects.acreate(
                                 ball=ball_obj,
                                 player=player,
@@ -111,8 +104,8 @@ class ChallengesCog(commands.GroupCog, group_name="challenges"):
                                 attack_bonus=random.randint(-20, 20),
                                 health_bonus=random.randint(-20, 20)
                             )
-                        except Ball.DoesNotExist:
-                            continue
+                    except Ball.DoesNotExist:
+                        continue
                 distributed_count += 1
             rank += 1
             
