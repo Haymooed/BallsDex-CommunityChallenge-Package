@@ -9,16 +9,23 @@ class Challenge(models.Model):
     
     GOAL_CHOICES =[
         ('balls', 'Balls Caught'),
-        ('currency', 'Currency Earned'),
     ]
     goal_type = models.CharField(max_length=16, choices=GOAL_CHOICES, default='balls')
     active = models.BooleanField(default=True)
-    
-    # JSON mapped ranks to prizes. Example: {"1": {"currency": 5000, "balls": [14, 21]}, "2": {"currency": 1000}}
-    reward_config = models.JSONField(default=dict, help_text="Mapping of Rank to rewards in JSON format.")
 
     def __str__(self):
         return self.name
+
+class ChallengeReward(models.Model):
+    challenge = models.ForeignKey(Challenge, on_delete=models.CASCADE, related_name="rewards")
+    rank = models.PositiveIntegerField(help_text="The rank this reward is given to (e.g., 1 for 1st place).")
+    ball = models.ForeignKey(Ball, on_delete=models.CASCADE, help_text="The specific ball to reward.")
+    amount = models.PositiveIntegerField(default=1, help_text="How many of this ball to give.")
+
+    class Meta:
+        ordering = ["rank"]
+        verbose_name = "Reward"
+        verbose_name_plural = "Rewards"
 
 class ChallengeParticipant(models.Model):
     challenge = models.ForeignKey(Challenge, on_delete=models.CASCADE, related_name='participants')
