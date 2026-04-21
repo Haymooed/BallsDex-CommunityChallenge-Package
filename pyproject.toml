@@ -5,14 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ballsdex-community-challenge"
 version = "0.0.0"
-
 description = "Community Challenge system for BallsDex v3"
 license = "MIT"
-authors = [
-    { name = "Haymooed" },
-]
+authors = [{ name = "Haymooed" }]
 readme = "README.md"
+dependencies = []
 
-dependencies = [
-
-]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["community_challenge*"]
