@@ -4,8 +4,8 @@ import django.db.models.deletion
 
 class Migration(migrations.Migration):
 
-    dependencies = [
-        ("bd_models", "0015_alter_ballinstance_server_id_and_more"),
+     dependencies = [
+        ("bd_models", "0014_alter_ball_options_alter_ballinstance_options_and_more"),  # not 0015
         ("community_challenge", "0005_challenge_challengeparticipant_and_more"),
     ]
 
